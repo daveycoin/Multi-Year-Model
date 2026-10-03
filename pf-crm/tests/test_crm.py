@@ -79,6 +79,18 @@ class CRMTests(unittest.TestCase):
         self.assertNotIn("Old", evs)
         self.assertNotIn("Done", evs)
 
+    def test_events_for_a_calendar_range(self):
+        self.person(name="Pat", birthday="1980-09-10", term_end=D(-20))
+        server.create_row(self.conn, "key_dates", {"title": "FYE", "date": "2020-09-30", "recurs_annually": 1})
+        server.create_row(self.conn, "key_dates", {"title": "One-off", "date": D(40)})
+        r = lambda a, b: {(e["title"], e["date"]) for e in server.build_events(self.conn, TODAY, 0, a, b)}
+        sept = r(dt.date(2026, 9, 1), dt.date(2026, 9, 30))           # a month in the past
+        self.assertEqual(sept, {("Pat's birthday", "2026-09-10"), ("FYE", "2026-09-30"), ("Pat: term ends", D(-20))})
+        span = r(dt.date(2026, 9, 1), dt.date(2027, 10, 31))           # annual items repeat across years
+        self.assertIn(("FYE", "2027-09-30"), span)
+        self.assertIn(("Pat's birthday", "2027-09-10"), span)
+        self.assertEqual(r(dt.date(2026, 11, 1), dt.date(2026, 11, 30)), {("One-off", D(40))})
+
     def test_rfp_deadline_event_only_for_active_deals(self):
         for stage in ("Proposal / RFP", "Lost"):
             server.create_row(self.conn, "deals", {"name": stage, "stage": stage, "issuer_id": self.issuer,

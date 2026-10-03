@@ -333,41 +333,65 @@ def next_occurrence(s, today):
             return c
 
 
-def build_events(conn, today, window):
+def build_events(conn, today, window, start=None, end=None):
     """Everything dated that the banker should see: key dates, term ends, birthdays,
-    anniversaries, RFP deadlines, expected pricing dates."""
-    out = []
+    anniversaries, RFP deadlines, expected pricing dates.
 
-    def add(d, kind, title, detail, link, remind=0):
-        if d is None:
-            return
-        days = (d - today).days
-        if days < -30 or days > max(window, remind):
-            return
-        out.append({"date": d.isoformat(), "days": days, "kind": kind, "title": title,
-                    "detail": detail or "", "link": link, "reminder": bool(remind) and days <= remind})
+    Default: the upcoming window (plus the last 30 days of anything unfinished).
+    With start/end (calendar view): every occurrence inside that range, past or future."""
+    out = []
+    ranged = start is not None and end is not None
+
+    def dates_for(s, annual):
+        if not annual:
+            d = to_date(s)
+            return [d] if d else []
+        if not ranged:
+            d = next_occurrence(s, today)
+            return [d] if d else []
+        p = parse_ymd(s)
+        if not p:
+            return []
+        res = []
+        for y in range(start.year, end.year + 1):
+            try:
+                res.append(dt.date(y, p[1], p[2]))
+            except ValueError:  # Feb 29 in a common year
+                res.append(dt.date(y, p[1], 28))
+        return res
+
+    def add(s, annual, kind, title, detail, link, remind=0):
+        for d in dates_for(s, annual):
+            days = (d - today).days
+            if ranged:
+                if not start <= d <= end:
+                    continue
+            elif days < -30 or days > max(window, remind):
+                continue
+            out.append({"date": d.isoformat(), "days": days, "kind": kind, "title": title,
+                        "detail": detail or "", "link": link, "reminder": bool(remind) and 0 <= days <= remind})
 
     for k in conn.execute("SELECT k.*, i.name AS issuer_name FROM key_dates k "
                           "LEFT JOIN issuers i ON i.id=k.issuer_id WHERE k.done=0"):
-        d = next_occurrence(k["date"], today) if k["recurs_annually"] else to_date(k["date"])
         link = {"entity": "issuers", "id": k["issuer_id"]} if k["issuer_id"] else None
-        add(d, k["kind"] or "Date", k["title"], k["issuer_name"], link, k["remind_days_before"] or 0)
+        add(k["date"], bool(k["recurs_annually"]), k["kind"] or "Date", k["title"], k["issuer_name"], link,
+            k["remind_days_before"] or 0)
 
     for p in conn.execute("SELECT p.*, i.name AS issuer_name, d.name AS developer_name FROM people p "
                           "LEFT JOIN issuers i ON i.id=p.issuer_id LEFT JOIN developers d ON d.id=p.developer_id"):
         org = p["issuer_name"] or p["developer_name"] or ""
         link = {"entity": "people", "id": p["id"]}
-        add(to_date(p["term_end"]), "Term Expiration", f"{p['name']}: term ends",
+        add(p["term_end"], False, "Term Expiration", f"{p['name']}: term ends",
             f"{p['title'] or ''} {org}".strip(), link, 90)
-        add(next_occurrence(p["birthday"], today), "Birthday", f"{p['name']}'s birthday", org, link)
+        add(p["birthday"], True, "Birthday", f"{p['name']}'s birthday", org, link)
         spouse = f" & {p['spouse']}" if p["spouse"] else ""
-        add(next_occurrence(p["anniversary"], today), "Anniversary", f"{p['name']}{spouse}: anniversary", org, link)
+        add(p["anniversary"], True, "Anniversary", f"{p['name']}{spouse}: anniversary", org, link)
 
     for d in conn.execute("SELECT d.*, i.name AS issuer_name FROM deals d LEFT JOIN issuers i ON i.id=d.issuer_id "
                           "WHERE d.stage NOT IN ('Closed','Lost','On Hold')"):
         link = {"entity": "deals", "id": d["id"]}
-        add(to_date(d["rfp_deadline"]), "RFP Deadline", f"RFP due: {d['name']}", d["issuer_name"], link, 14)
-        add(to_date(d["expected_date"]), "Expected Pricing", f"Expected pricing: {d['name']}", d["issuer_name"], link)
+        add(d["rfp_deadline"], False, "RFP Deadline", f"RFP due: {d['name']}", d["issuer_name"], link, 14)
+        add(d["expected_date"], False, "Expected Pricing", f"Expected pricing: {d['name']}", d["issuer_name"], link)
 
     out.sort(key=lambda e: (e["date"], e["title"]))
     return out
@@ -758,6 +782,11 @@ class Handler(BaseHTTPRequestHandler):
         if method == "GET" and head == "dashboard":
             return self.send(200, dashboard(conn, today))
         if method == "GET" and head == "events":
+            if "start" in q or "end" in q:
+                start, end = to_date(q.get("start")), to_date(q.get("end"))
+                if not start or not end or end < start or (end - start).days > 400:
+                    raise ValueError("start and end must be YYYY-MM-DD dates, at most 400 days apart")
+                return self.send(200, build_events(conn, today, 0, start, end))
             return self.send(200, build_events(conn, today, int(q.get("window", 30))))
         if method == "GET" and head == "digest.html":
             return self.send(200, build_digest(conn, today)[0], "text/html; charset=utf-8")

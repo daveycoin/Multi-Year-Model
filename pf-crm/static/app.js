@@ -186,6 +186,74 @@ function eventRow(e) {
 }
 const eventsTable = (evs, empty) => evs.length ? `<div class="tablewrap"><table><tbody>${evs.map(eventRow).join("")}</tbody></table></div>` : `<div class="empty">${empty}</div>`;
 
+// ------------------------------------------------- list / calendar toggle
+const KIND_CLASS = { "Election": "k-elec", "Bond Election": "k-elec", "Budget Adoption": "k-budget", "Fiscal Year End": "k-budget",
+  "Term Expiration": "k-term", "RFP Deadline": "k-deal", "Expected Pricing": "k-deal", "Birthday": "k-personal", "Anniversary": "k-personal" };
+const LEGEND = [["k-elec", "Elections"], ["k-budget", "Budget / fiscal year"], ["k-term", "Terms"], ["k-deal", "RFPs & pricing"], ["k-personal", "Birthdays & anniversaries"], ["k-other", "Other"]];
+const pad2 = n => String(n).padStart(2, "0");
+const isoDate = d => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+const store = { get: k => { try { return localStorage.getItem(k); } catch { return null; } }, set: (k, v) => { try { localStorage.setItem(k, v); } catch { } } };
+
+function evAnchor(e, cls, text) {
+  const t = esc(`${e.title}${e.detail ? " · " + e.detail : ""}`), l = e.link;
+  if (!l) return `<span class="${cls}" title="${t}">${esc(text)}</span>`;
+  if (l.entity === "deals") return `<a class="${cls}" href="#" data-edit="deals:${l.id}" title="${t}">${esc(text)}</a>`;
+  return `<a class="${cls}" href="#/${l.entity}/${l.id}" title="${t}">${esc(text)}</a>`;
+}
+
+// Draws a List | Calendar switch into `seg` and the chosen view into `body`. Remembers the choice per page.
+function mountEventsView(seg, body, key, renderList) {
+  let view = store.get("view:" + key) === "calendar" ? "calendar" : "list";
+  const draw = async () => {
+    seg.innerHTML = ["list", "calendar"].map(v => `<button class="${v === view ? "on" : ""}" data-v="${v}">${v === "list" ? "List" : "Calendar"}</button>`).join("");
+    if (view === "list") body.innerHTML = await renderList(); else await mountCalendar(body, key);
+  };
+  seg.addEventListener("click", e => {
+    const b = e.target.closest("[data-v]");
+    if (b && b.dataset.v !== view) { view = b.dataset.v; store.set("view:" + key, view); draw().catch(err => { body.innerHTML = `<div class="empty" style="color:var(--danger)">${esc(err.message)}</div>`; }); }
+  });
+  return draw();
+}
+
+async function mountCalendar(body, key) {
+  const mk = "cal:" + key;
+  let ym = sessionStorage.getItem(mk) || todayISO().slice(0, 7), sel = null, evs = [], g;
+  const load = async () => {
+    const [Y, M] = ym.split("-").map(Number), lead = new Date(Y, M - 1, 1).getDay();
+    const weeks = Math.ceil((lead + new Date(Y, M, 0).getDate()) / 7);
+    const start = new Date(Y, M - 1, 1 - lead), end = new Date(Y, M - 1, 1 - lead + weeks * 7 - 1);
+    evs = await api("GET", `/events?start=${isoDate(start)}&end=${isoDate(end)}`);
+    g = { Y, M, start, weeks };
+  };
+  const draw = () => {
+    const by = {}; evs.forEach(e => (by[e.date] ??= []).push(e));
+    const today = todayISO();
+    let cells = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map(d => `<div class="dow">${d}</div>`).join("");
+    for (let i = 0; i < g.weeks * 7; i++) {
+      const d = new Date(g.start.getFullYear(), g.start.getMonth(), g.start.getDate() + i), iso = isoDate(d), list = by[iso] || [];
+      cells += `<div class="day ${d.getMonth() !== g.M - 1 ? "out" : ""} ${iso === today ? "today" : ""} ${iso === sel ? "sel" : ""}" data-day="${iso}">
+        <div class="dnum"><span>${d.getDate()}</span><button class="addday" title="Add a date on this day" data-add="key_dates" data-prefill='${JSON.stringify({ date: iso })}'>+</button></div>
+        ${list.slice(0, 3).map(e => evAnchor(e, "ev " + (KIND_CLASS[e.kind] || "k-other"), e.title)).join("")}
+        ${list.length > 3 ? `<a href="#" class="more" data-day="${iso}">+${list.length - 3} more</a>` : ""}</div>`;
+    }
+    body.innerHTML = `<div class="cal-head"><div><button class="btn sm" data-cal="prev">‹</button> <button class="btn sm" data-cal="today">Today</button> <button class="btn sm" data-cal="next">›</button></div>
+      <h3>${MONTH_NAMES[g.M - 1]} ${g.Y}</h3><span></span></div><div class="cal">${cells}</div>
+      <div class="legend">${LEGEND.map(([c, l]) => `<span class="ev ${c}">${l}</span>`).join("")}</div>
+      ${sel ? `<div class="daydetail"><h2>${esc(fdate(sel))}</h2>${eventsTable(by[sel] || [], "Nothing on this day.")}</div>` : ""}`;
+  };
+  body.onclick = async e => {
+    if (e.target.closest("a.ev, button.addday")) return;  // chips navigate; "+" opens the add form
+    const c = e.target.closest("[data-cal]"), day = e.target.closest("[data-day]");
+    if (c) {
+      e.preventDefault();
+      const [Y, M] = ym.split("-").map(Number), d = c.dataset.cal === "today" ? new Date() : new Date(Y, M - 1 + (c.dataset.cal === "next" ? 1 : -1), 1);
+      ym = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}`; sessionStorage.setItem(mk, ym); sel = null;
+      try { await load(); draw(); } catch (err) { alert(err.message); }
+    } else if (day) { e.preventDefault(); sel = sel === day.dataset.day ? null : day.dataset.day; draw(); }
+  };
+  await load(); draw();
+}
+
 // -------------------------------------------------------------------- pages
 const pages = {};
 
@@ -205,9 +273,11 @@ pages.dashboard = async main => {
     <div class="stats">${Object.entries(d.stats).map(([k, v]) => `<div class="stat"><b>${v}</b><span>${k}</span></div>`).join("")}</div>
     <div class="panel"><div class="head"><h2>Overdue follow-ups (${d.overdue.length})</h2></div>
       ${od ? `<div class="tablewrap"><table><thead><tr><th>Contact</th><th>Organization</th><th>Pri</th><th>Last contact</th><th>Status</th><th></th></tr></thead><tbody>${od}</tbody></table></div>` : `<div class="empty">You're caught up.</div>`}</div>
-    <div class="panel"><div class="head"><h2>Upcoming dates &amp; reminders (next ${d.window} days)</h2><a href="#/dates">All dates →</a></div>
-      ${eventsTable(d.events, "Nothing coming up.")}</div>
+    <div class="panel"><div class="head"><h2>Dates &amp; reminders</h2><div><a href="#/dates" style="margin-right:12px">All dates →</a><span class="seg" id="seg-dash"></span></div></div>
+      <div id="body-dash"></div></div>
     <div class="grid2">${pipe("standard", "Issuer financings")}${pipe("developer", "Developer deals")}</div>`;
+  await mountEventsView($("#seg-dash"), $("#body-dash"), "dashboard",
+    async () => `<div class="muted" style="margin-bottom:6px">Next ${d.window} days</div>${eventsTable(d.events, "Nothing coming up.")}`);
 };
 
 async function listPage(main, entity, opts = {}) {
@@ -304,14 +374,16 @@ pages.deals = async (main, which) => {
 
 pages.dates = async main => {
   const win = +(sessionStorage.getItem("win") || 90);
-  const [evs, kd] = await Promise.all([api("GET", `/events?window=${win}`), api("GET", "/key_dates")]);
+  const kd = await api("GET", "/key_dates");
   const cols = ENT.key_dates.cols();
   main.innerHTML = `<div class="head"><div><h1>Dates &amp; reminders</h1><div class="sub">Includes term ends, birthdays, anniversaries, RFP deadlines and expected pricing dates pulled from your records.</div></div>
     <button class="btn primary" data-add="key_dates">+ Add date</button></div>
-    <div class="panel"><div class="head"><h2>Coming up</h2><select id="win" style="width:auto">${[30, 60, 90, 180, 365].map(n => `<option value="${n}" ${n === win ? "selected" : ""}>Next ${n} days</option>`).join("")}</select></div>
-    ${eventsTable(evs, "Nothing in this window.")}</div>
+    <div class="panel"><div class="head"><h2>Coming up</h2><span class="seg" id="seg-dates"></span></div><div id="body-dates"></div></div>
     <div class="panel"><h2>Key dates you've entered (${kd.length})</h2>${table(cols, kd)}</div>`;
-  $("#win").addEventListener("change", e => { sessionStorage.setItem("win", e.target.value); route(); });
+  await mountEventsView($("#seg-dates"), $("#body-dates"), "dates", async () => {
+    const evs = await api("GET", `/events?window=${win}`);
+    return `<div class="toolbar"><select data-win style="min-width:0">${[30, 60, 90, 180, 365].map(n => `<option value="${n}" ${n === win ? "selected" : ""}>Next ${n} days</option>`).join("")}</select></div>${eventsTable(evs, "Nothing in this window.")}`;
+  });
 };
 
 pages.import = async main => {
@@ -450,6 +522,7 @@ document.addEventListener("click", async e => {
   } catch (err) { alert(err.message); }
 });
 document.addEventListener("change", async e => {
+  if (e.target.dataset.win !== undefined) { sessionStorage.setItem("win", e.target.value); return route(); }
   if (!e.target.dataset.move) return;
   try { await api("PUT", `/deals/${e.target.dataset.move}`, { stage: e.target.value }); route(); } catch (err) { alert(err.message); route(); }
 });
