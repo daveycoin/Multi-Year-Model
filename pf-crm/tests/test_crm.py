@@ -198,6 +198,137 @@ class CRMTests(unittest.TestCase):
         finally:
             server.DB_PATH = old
 
+    def test_tasks_lifecycle_events_and_digest(self):
+        pid = self.person(name="Contact")
+        tid = server.create_row(self.conn, "tasks", {"title": "Send deck", "due_date": D(2), "person_id": pid})
+        task = server.list_rows(self.conn, "tasks", row_id=tid)[0]
+        self.assertEqual((task["issuer_id"], task["done"]), (self.issuer, 0))             # issuer inferred from the person
+        server.create_row(self.conn, "tasks", {"title": "Late one", "due_date": D(-3)})
+        server.create_row(self.conn, "tasks", {"title": "Far off", "due_date": D(40)})
+        due = server.tasks_due(self.conn, TODAY)
+        self.assertEqual([t["title"] for t in due], ["Late one", "Send deck"])           # overdue first; far-off task excluded
+        self.assertIn("Send deck", {e["title"] for e in server.build_events(self.conn, TODAY, 30)})
+        self.assertIn("Send deck", server.build_digest(self.conn, TODAY)[1])
+        server.CURRENT_DATE = TODAY
+        try:
+            server.update_row(self.conn, "tasks", tid, {"done": 1})
+        finally:
+            server.CURRENT_DATE = None
+        task = server.list_rows(self.conn, "tasks", row_id=tid)[0]
+        self.assertEqual((task["done"], task["done_at"]), (1, TODAY.isoformat()))
+        self.assertNotIn("Send deck", [t["title"] for t in server.tasks_due(self.conn, TODAY)])
+        self.assertEqual(len(server.list_rows(self.conn, "tasks", {"done": 0})), 2)
+        server.update_row(self.conn, "tasks", tid, {"done": 0})
+        self.assertIsNone(server.list_rows(self.conn, "tasks", row_id=tid)[0]["done_at"])
+
+    def test_timeline_records_stage_moves_tasks_and_date_changes(self):
+        pid = self.person(name="Pat")
+        did = server.create_row(self.conn, "deals", {"name": "Deal A", "issuer_id": self.issuer})
+        server.update_row(self.conn, "deals", did, {"stage": "Structuring"})
+        server.update_row(self.conn, "deals", did, {"par": 5})                           # not a stage change: no entry
+        kid = server.create_row(self.conn, "key_dates", {"title": "Budget", "date": D(10), "issuer_id": self.issuer})
+        server.update_row(self.conn, "key_dates", kid, {"date": D(20)})
+        tid = server.create_row(self.conn, "tasks", {"title": "Follow up", "person_id": pid})
+        server.update_row(self.conn, "tasks", tid, {"done": 1})
+        server.create_row(self.conn, "interactions", {"person_id": pid, "date": D(-1), "type": "Call", "notes": "Chatted"})
+        texts = [i["text"] for i in server.timeline(self.conn, issuer_id=self.issuer)]
+        for expected in ("Financing added: Deal A (Idea)", "Deal A: stage Idea \u2192 Structuring",
+                         f"Date moved: Budget {D(10)} \u2192 {D(20)}", "Task completed: Follow up", "Chatted"):
+            self.assertIn(expected, texts)
+        self.assertEqual(sum("Deal A: stage" in t for t in texts), 1)
+        mine = server.timeline(self.conn, person_id=pid)
+        self.assertEqual({i["kind"] for i in mine}, {"Call", "Task", "Person"})
+        self.assertEqual(len(server.timeline(self.conn, limit=2)), 2)
+
+    def test_closed_date_set_and_cleared_with_stage(self):
+        did = server.create_row(self.conn, "deals", {"name": "D"})
+        server.CURRENT_DATE = TODAY
+        try:
+            server.update_row(self.conn, "deals", did, {"stage": "Closed"})
+            self.assertEqual(server.list_rows(self.conn, "deals", row_id=did)[0]["closed_date"], TODAY.isoformat())
+            server.update_row(self.conn, "deals", did, {"stage": "Pricing"})
+        finally:
+            server.CURRENT_DATE = None
+        self.assertIsNone(server.list_rows(self.conn, "deals", row_id=did)[0]["closed_date"])
+
+    def test_search_across_entities_with_ranking_and_escaping(self):
+        pid = self.person(name="Rebecca Stone", title="CFO", email="rs@x.gov", notes="loves sailing")
+        server.create_row(self.conn, "issuers", {"name": "Stone County", "sector": "County"})
+        server.create_row(self.conn, "deals", {"name": "Refunding", "ma_name": "Stone Advisors", "issuer_id": self.issuer})
+        server.create_row(self.conn, "interactions", {"person_id": pid, "date": D(-1), "notes": "Discussed 100% funding_gap"})
+        res = {g["entity"]: [r["title"] for r in g["results"]] for g in server.search(self.conn, "stone")["groups"]}
+        self.assertEqual(res["issuers"], ["Stone County"])
+        self.assertEqual(res["people"], ["Rebecca Stone"])
+        self.assertEqual(res["deals"], ["Refunding"])                                    # matched through the MA name
+        self.assertEqual([r["title"] for g in server.search(self.conn, "sailing")["groups"] for r in g["results"]],
+                         ["Rebecca Stone"])                                               # matched through personal notes
+        self.assertEqual(server.search(self.conn, "rebecca cfo")["total"], 1)             # all terms must match
+        self.assertEqual(server.search(self.conn, "100% funding_gap")["groups"][0]["entity"], "interactions")
+        self.assertEqual(server.search(self.conn, "%")["total"], 1)                       # a literal %, not a wildcard
+        self.assertEqual(server.search(self.conn, "   ")["total"], 0)
+
+    def test_reports_and_custom_report(self):
+        iss2 = server.create_row(self.conn, "issuers", {"name": "Other ISD", "sector": "K-12 School District"})
+        mk = lambda **kw: server.create_row(self.conn, "deals", kw)
+        mk(name="a", issuer_id=self.issuer, stage="Pricing", par=100, probability=50, expected_date="2026-11-10")
+        mk(name="b", issuer_id=iss2, stage="Idea", par=300, probability=10, expected_date="2027-02-01")
+        mk(name="c", issuer_id=iss2, stage="Closed", par=70, closed_date="2026-03-01")
+        mk(name="d", issuer_id=iss2, stage="Lost", par=30, closed_date="2026-05-01")
+        mk(name="e", issuer_id=iss2, stage="Closed", par=10, closed_date="2025-05-01")
+        r = server.reports(self.conn, TODAY)
+        self.assertEqual((r["kpis"]["active_par"], r["kpis"]["weighted_par"]), (400, 80))
+        self.assertEqual({q["label"]: q["par"] for q in r["by_quarter"]}, {"2026 Q4": 100, "2027 Q1": 300})
+        self.assertEqual({s["label"]: s["par"] for s in r["by_sector"]}, {"K-12 School District": 300, "City": 100})
+        self.assertEqual([(y["label"], y["closed_par"], y["lost_par"]) for y in r["outcomes"]], [("2025", 10, 0), ("2026", 70, 30)])
+        self.assertEqual((r["kpis"]["win_rate"], r["kpis"]["closed_ytd_par"]), (67, 70))
+        self.assertEqual(len(r["activity"]), 12)
+        rep = server.custom_report(self.conn, {"entity": "deals", "group": "stage", "measure": "par", "active": "0"})
+        self.assertEqual([(x["label"], x["value"]) for x in rep["rows"]],
+                         [("Idea", 300), ("Pricing", 100), ("Closed", 80), ("Lost", 30)])   # stage order, not alphabetical
+        rep = server.custom_report(self.conn, {"entity": "deals", "group": "sector", "measure": "weighted"})
+        self.assertEqual((rep["rows"][0]["label"], rep["total"]), ("City", 80))             # active only by default
+        self.assertEqual(server.custom_report(self.conn, {"entity": "issuers", "group": "sector"})["total"], 2)
+        for bad in ({"entity": "deals", "group": "nope"}, {"entity": "people", "group": "group", "measure": "par"}):
+            with self.assertRaises(ValueError):
+                server.custom_report(self.conn, bad)
+
+    def test_stale_relationships_report(self):
+        iss2 = server.create_row(self.conn, "issuers", {"name": "Fresh", "sector": "City"})
+        self.person(name="Old", last_contact=D(-100))
+        server.create_row(self.conn, "people", {"name": "New", "last_contact": D(-5), "links": [{"issuer_id": iss2}]})
+        server.create_row(self.conn, "deals", {"name": "x", "issuer_id": self.issuer})
+        stale = server.reports(self.conn, TODAY)["stale"]
+        self.assertEqual([(s["name"], s["days"], s["n_active"]) for s in stale], [("City of Test", 100, 1)])
+
+    def test_issuer_state_stays_plain_text(self):
+        iid = server.create_row(self.conn, "issuers", {"name": "Texas City", "sector": "City", "state": "TX"})
+        self.assertEqual(server.list_rows(self.conn, "issuers", row_id=iid)[0]["state"], "TX")
+        self.assertEqual([r["state"] for r in server.list_rows(self.conn, "issuers", {"sector": "City"}) if r["id"] == iid], ["TX"])
+        self.assertEqual(server.list_rows(self.conn, "issuers", row_id=self.issuer)[0]["state"], None)   # unset stays unset
+
+    def test_saved_views_round_trip_through_api(self):
+        old = server.DB_PATH
+        server.DB_PATH = os.path.join(self.tmp.name, "views.db")
+        try:
+            code, row, _, _ = server.handle_api("POST", "/api/saved_views",
+                                                '{"page": "people", "name": "Elected", "state": {"group": "Elected", "q": ""}}')
+            self.assertEqual((code, row["state"]), (201, {"group": "Elected", "q": ""}))
+            code, rows, _, _ = server.handle_api("GET", "/api/saved_views?page=people")
+            self.assertEqual([r["name"] for r in rows], ["Elected"])
+            self.assertEqual(server.handle_api("GET", "/api/saved_views?page=issuers")[1], [])
+            for path in ("/api/search?q=x", "/api/reports", "/api/timeline", "/api/report?entity=deals&group=stage"):
+                self.assertEqual(server.handle_api("GET", path, today=TODAY)[0], 200, path)
+            self.assertEqual(server.handle_api("GET", "/api/report?entity=deals&group=bogus")[0], 400)
+        finally:
+            server.DB_PATH = old
+
+    def test_old_database_gains_closed_date_column(self):
+        self.conn.execute("ALTER TABLE deals DROP COLUMN closed_date")
+        self.conn.commit()
+        self.conn.close()
+        self.conn = server.connect(os.path.join(self.tmp.name, "t.db"))
+        self.assertIn("closed_date", server.table_columns(self.conn, "deals"))
+
     def test_demo_seed_and_digest(self):
         other = server.connect(os.path.join(self.tmp.name, "demo.db"))
         self.assertTrue(server.seed_demo(other))

@@ -75,7 +75,7 @@ CREATE TABLE IF NOT EXISTS deals (
   project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
   purpose TEXT, security_type TEXT, par REAL, expected_date TEXT, role TEXT,
   probability INTEGER, ma_name TEXT, bond_counsel TEXT, trustee TEXT,
-  competing_banks TEXT, rfp_deadline TEXT, notes TEXT,
+  competing_banks TEXT, rfp_deadline TEXT, notes TEXT, closed_date TEXT,
   created_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS key_dates (
   id INTEGER PRIMARY KEY, title TEXT NOT NULL, kind TEXT, date TEXT NOT NULL,
@@ -88,10 +88,29 @@ CREATE TABLE IF NOT EXISTS interactions (
   issuer_id INTEGER REFERENCES issuers(id) ON DELETE SET NULL,
   date TEXT NOT NULL, type TEXT, notes TEXT,
   created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS tasks (
+  id INTEGER PRIMARY KEY, title TEXT NOT NULL, due_date TEXT, priority TEXT DEFAULT 'Normal',
+  done INTEGER DEFAULT 0, done_at TEXT, notes TEXT,
+  person_id INTEGER REFERENCES people(id) ON DELETE CASCADE,
+  issuer_id INTEGER REFERENCES issuers(id) ON DELETE CASCADE,
+  deal_id INTEGER REFERENCES deals(id) ON DELETE CASCADE,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS activity (
+  id INTEGER PRIMARY KEY, date TEXT NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL,
+  issuer_id INTEGER REFERENCES issuers(id) ON DELETE CASCADE,
+  person_id INTEGER REFERENCES people(id) ON DELETE CASCADE,
+  deal_id INTEGER REFERENCES deals(id) ON DELETE CASCADE,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS saved_views (
+  id INTEGER PRIMARY KEY, page TEXT NOT NULL, name TEXT NOT NULL, state TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
 CREATE INDEX IF NOT EXISTS ix_people_issuer ON people(issuer_id);
 CREATE INDEX IF NOT EXISTS ix_deals_issuer ON deals(issuer_id);
 CREATE INDEX IF NOT EXISTS ix_inter_person ON interactions(person_id);
+CREATE INDEX IF NOT EXISTS ix_tasks_due ON tasks(done, due_date);
+CREATE INDEX IF NOT EXISTS ix_activity_issuer ON activity(issuer_id);
+CREATE INDEX IF NOT EXISTS ix_activity_person ON activity(person_id);
 """
 
 # Each table's list/detail query. Filters (?col=val) apply to the base table alias "t".
@@ -116,6 +135,10 @@ QUERIES = {
               "LEFT JOIN projects p ON p.id=t.project_id", "t.expected_date IS NULL, t.expected_date"),
     "key_dates": ("SELECT t.*, i.name AS issuer_name FROM key_dates t "
                   "LEFT JOIN issuers i ON i.id=t.issuer_id", "t.date"),
+    "tasks": ("SELECT t.*, p.name AS person_name, i.name AS issuer_name, d.name AS deal_name FROM tasks t "
+              "LEFT JOIN people p ON p.id=t.person_id LEFT JOIN issuers i ON i.id=t.issuer_id "
+              "LEFT JOIN deals d ON d.id=t.deal_id", "t.done, t.due_date IS NULL, t.due_date, t.id"),
+    "saved_views": ("SELECT t.* FROM saved_views t", "t.name COLLATE NOCASE"),
     "interactions": ("SELECT t.*, p.name AS person_name, i.name AS issuer_name FROM interactions t "
                      "LEFT JOIN people p ON p.id=t.person_id "
                      "LEFT JOIN issuers i ON i.id=t.issuer_id", "t.date DESC, t.id DESC"),
@@ -132,9 +155,27 @@ def connect(path=None):
     conn.executescript(SCHEMA)
     for k, v in DEFAULT_SETTINGS.items():
         conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v))
+    if "closed_date" not in table_columns(conn, "deals"):  # databases created before reports existed
+        conn.execute("ALTER TABLE deals ADD COLUMN closed_date TEXT")
     backfill_links(conn)
     conn.commit()
     return conn
+
+
+CURRENT_DATE = None  # set per request by handle_api so "today" follows the caller's clock (the browser demo passes local date)
+
+
+def today_date():
+    return CURRENT_DATE or dt.date.today()
+
+
+def today_iso():
+    return today_date().isoformat()
+
+
+def log_activity(conn, kind, text, issuer_id=None, person_id=None, deal_id=None, date=None):
+    conn.execute("INSERT INTO activity(date,kind,text,issuer_id,person_id,deal_id) VALUES(?,?,?,?,?,?)",
+                 (date or today_iso(), kind, text, issuer_id, person_id, deal_id))
 
 
 def guess_groups(title):
@@ -207,7 +248,7 @@ def clean_body(conn, table, body):
     for k, v in body.items():
         if k not in cols:
             continue
-        if k == "extra" and isinstance(v, dict):
+        if k in ("extra", "state") and isinstance(v, dict):
             v = json.dumps(v)
         if isinstance(v, str):
             v = v.strip() or None
@@ -232,6 +273,12 @@ def list_rows(conn, table, filters=None, row_id=None):
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY " + order
     rows = [row_dict(r) for r in conn.execute(sql, args)]
+    if table == "saved_views":  # "state" is JSON here, but a plain text column ("TX") on issuers, so parse per table
+        for r in rows:
+            try:
+                r["state"] = json.loads(r["state"])
+            except (ValueError, TypeError):
+                r["state"] = {}
     if table == "people":
         attach_links(conn, rows)
         if linked is not None:  # the groups this person belongs to *at this issuer*
@@ -258,8 +305,15 @@ def create_row(conn, table, body):
         if data.get("stage") and data["stage"] not in STAGES[data["pipeline"]]:
             raise ValueError(f"stage '{data['stage']}' is not valid for the {data['pipeline']} pipeline")
         data.setdefault("stage", STAGES[data["pipeline"]][0])
+        if data["stage"] in ("Closed", "Lost"):
+            data.setdefault("closed_date", today_iso())
+    if table == "tasks" and data.get("person_id") and not data.get("issuer_id"):
+        r = conn.execute("SELECT issuer_id FROM people WHERE id=?", (data["person_id"],)).fetchone()
+        data["issuer_id"] = r["issuer_id"] if r else None
+    if table == "tasks" and data.get("done"):
+        data.setdefault("done_at", today_iso())
     if table == "interactions":
-        data.setdefault("date", dt.date.today().isoformat())
+        data.setdefault("date", today_iso())
         if data.get("person_id") and not data.get("issuer_id"):
             r = conn.execute("SELECT issuer_id FROM people WHERE id=?", (data["person_id"],)).fetchone()
             data["issuer_id"] = r["issuer_id"] if r else None
@@ -280,28 +334,289 @@ def create_row(conn, table, body):
     after_write(conn, table, rid, data)
     if table == "people":
         set_links(conn, rid, links) if links is not None else backfill_links(conn)
+    _log_create(conn, table, rid, data)
     conn.commit()
     return rid
+
+
+def _log_create(conn, table, rid, data):
+    """Write the activity-timeline entry for a newly created record."""
+    if table == "deals":
+        d = conn.execute("SELECT name, stage, issuer_id FROM deals WHERE id=?", (rid,)).fetchone()
+        log_activity(conn, "Deal", f"Financing added: {d['name']} ({d['stage']})", issuer_id=d["issuer_id"], deal_id=rid)
+    elif table == "tasks":
+        log_activity(conn, "Task", f"Task added: {data['title']}", issuer_id=data.get("issuer_id"),
+                     person_id=data.get("person_id"), deal_id=data.get("deal_id"))
+    elif table == "key_dates":
+        log_activity(conn, "Date", f"Date added: {data['title']} ({data.get('date')})", issuer_id=data.get("issuer_id"))
+    elif table == "people":
+        p = conn.execute("SELECT name, issuer_id FROM people WHERE id=?", (rid,)).fetchone()
+        log_activity(conn, "Person", f"Contact added: {p['name']}", issuer_id=p["issuer_id"], person_id=rid)
 
 
 def update_row(conn, table, rid, body):
     data = clean_body(conn, table, body)
     links = body.get("links") if table == "people" else None
-    if not conn.execute(f"SELECT 1 FROM {table} WHERE id=?", (rid,)).fetchone():
+    old = conn.execute(f"SELECT * FROM {table} WHERE id=?", (rid,)).fetchone()
+    if not old:
         raise LookupError("not found")
     if table == "deals":
-        cur = conn.execute("SELECT pipeline FROM deals WHERE id=?", (rid,)).fetchone()
-        pl = data.get("pipeline", cur["pipeline"])
+        pl = data.get("pipeline", old["pipeline"])
         if pl not in STAGES:
             raise ValueError("unknown pipeline")
         if "stage" in data and data["stage"] not in STAGES[pl]:
             raise ValueError(f"stage '{data['stage']}' is not valid for the {pl} pipeline")
+        if "stage" in data and data["stage"] != old["stage"] and "closed_date" not in data:
+            # the date a deal reached Closed or Lost feeds the reports; moving it back out clears the date
+            data["closed_date"] = (old["closed_date"] or today_iso()) if data["stage"] in ("Closed", "Lost") else None
+    if table == "tasks" and "done" in data and bool(data["done"]) != bool(old["done"]):
+        data["done_at"] = today_iso() if data["done"] else None
     if data:
         conn.execute(f"UPDATE {table} SET {','.join(f'{c}=?' for c in data)} WHERE id=?", [*data.values(), rid])
         after_write(conn, table, rid, data)
     if table == "people":
         set_links(conn, rid, links) if links is not None else backfill_links(conn)
+    _log_update(conn, table, rid, old, data)
     conn.commit()
+
+
+def _log_update(conn, table, rid, old, data):
+    if table == "deals" and "stage" in data and data["stage"] != old["stage"]:
+        issuer = conn.execute("SELECT issuer_id FROM deals WHERE id=?", (rid,)).fetchone()["issuer_id"]
+        log_activity(conn, "Deal", f"{old['name']}: stage {old['stage']} \u2192 {data['stage']}", issuer_id=issuer, deal_id=rid)
+    elif table == "tasks" and "done" in data and bool(data["done"]) != bool(old["done"]) and data["done"]:
+        log_activity(conn, "Task", f"Task completed: {old['title']}", issuer_id=old["issuer_id"],
+                     person_id=old["person_id"], deal_id=old["deal_id"])
+    elif table == "key_dates" and "date" in data and data["date"] != old["date"]:
+        log_activity(conn, "Date", f"Date moved: {old['title']} {old['date']} \u2192 {data['date']}", issuer_id=old["issuer_id"])
+
+
+
+# --------------------------------------------------------------- tasks / timeline
+def tasks_due(conn, today, days=7):
+    """Open tasks that are overdue or due within `days`, soonest first."""
+    out = []
+    for t in list_rows(conn, "tasks", {"done": 0}):
+        due = to_date(t["due_date"])
+        if due and (due - today).days <= days:
+            out.append({k: t[k] for k in ("id", "title", "due_date", "priority", "person_id", "person_name",
+                                          "issuer_id", "issuer_name", "deal_name")} | {"days": (due - today).days})
+    out.sort(key=lambda r: (r["days"], r["priority"] != "High"))
+    return out
+
+
+def timeline(conn, issuer_id=None, person_id=None, limit=100):
+    """Merged, newest-first feed of interactions and logged changes (stage moves, tasks, dates)."""
+    items = []
+    where, args = [], []
+    if issuer_id:
+        where.append("i.issuer_id=?"); args.append(issuer_id)
+    if person_id:
+        where.append("i.person_id=?"); args.append(person_id)
+    sql = ("SELECT i.*, p.name AS person_name FROM interactions i JOIN people p ON p.id=i.person_id"
+           + (" WHERE " + " AND ".join(where) if where else ""))
+    for r in conn.execute(sql, args):
+        items.append({"date": r["date"], "kind": r["type"] or "Note", "text": r["notes"] or "(no notes)",
+                      "person_id": r["person_id"], "person_name": r["person_name"], "link": None,
+                      "edit": {"entity": "interactions", "id": r["id"]}, "_k": (r["date"], r["created_at"] or "", r["id"])})
+    where, args = [], []
+    if issuer_id:
+        where.append("a.issuer_id=?"); args.append(issuer_id)
+    if person_id:
+        where.append("a.person_id=?"); args.append(person_id)
+    sql = ("SELECT a.*, p.name AS person_name FROM activity a LEFT JOIN people p ON p.id=a.person_id"
+           + (" WHERE " + " AND ".join(where) if where else ""))
+    for r in conn.execute(sql, args):
+        link = ({"entity": "deals", "id": r["deal_id"]} if r["deal_id"] and r["kind"] == "Deal" else
+                {"entity": "people", "id": r["person_id"]} if r["person_id"] and r["kind"] == "Person" else None)
+        items.append({"date": r["date"], "kind": r["kind"], "text": r["text"], "person_id": r["person_id"],
+                      "person_name": r["person_name"], "link": link, "edit": None,
+                      "_k": (r["date"], r["created_at"] or "", r["id"])})
+    items.sort(key=lambda i: i["_k"], reverse=True)
+    for i in items:
+        del i["_k"]
+    return items[:limit]
+
+
+# ------------------------------------------------------------------------ search
+def _hay(*cols):
+    return "lower(" + " || ' ' || ".join(f"COALESCE({c},'')" for c in cols) + ")"
+
+
+SEARCH = {
+    "issuers": ("Issuers", "SELECT t.id, t.name AS title, t.sector || COALESCE(' · ' || t.state, '') AS sub, "
+                + _hay("t.name", "t.sector", "t.state", "t.primary_banker", "t.our_coverage_banker", "t.other_bankers", "t.notes")
+                + " AS hay FROM issuers t"),
+    "people": ("People", "SELECT t.id, t.name AS title, COALESCE(t.title, '') || COALESCE(' · ' || i.name, '') AS sub, "
+               + _hay("t.name", "t.title", "t.email", "t.phone", "t.spouse", "t.kids", "t.personal_notes", "t.notes", "i.name",
+                      "(SELECT group_concat(ii.name, ' ') FROM person_issuers l JOIN issuers ii ON ii.id=l.issuer_id WHERE l.person_id=t.id)")
+               + " AS hay FROM people t LEFT JOIN issuers i ON i.id=t.issuer_id"),
+    "developers": ("Developers", "SELECT t.id, t.name AS title, COALESCE(t.website, '') AS sub, "
+                   + _hay("t.name", "t.website", "t.notes") + " AS hay FROM developers t"),
+    "projects": ("Developer projects", "SELECT t.id, t.name AS title, COALESCE(d.name, '') || COALESCE(' · ' || t.location, '') AS sub, "
+                 + _hay("t.name", "t.location", "t.structure", "t.notes", "d.name", "i.name")
+                 + " AS hay FROM projects t LEFT JOIN developers d ON d.id=t.developer_id LEFT JOIN issuers i ON i.id=t.issuer_id"),
+    "deals": ("Financings", "SELECT t.id, t.name AS title, t.stage || COALESCE(' · ' || i.name, '') AS sub, "
+              + _hay("t.name", "t.stage", "t.purpose", "t.security_type", "t.ma_name", "t.bond_counsel", "t.trustee",
+                     "t.competing_banks", "t.notes", "i.name", "p.name")
+              + " AS hay FROM deals t LEFT JOIN issuers i ON i.id=t.issuer_id LEFT JOIN projects p ON p.id=t.project_id"),
+    "tasks": ("Tasks", "SELECT t.id, t.title AS title, (CASE WHEN t.done THEN 'Done' ELSE 'Open' END) || COALESCE(' · due ' || t.due_date, '') AS sub, "
+              + _hay("t.title", "t.notes", "p.name", "i.name") + " AS hay FROM tasks t "
+              "LEFT JOIN people p ON p.id=t.person_id LEFT JOIN issuers i ON i.id=t.issuer_id"),
+    "key_dates": ("Dates", "SELECT t.id, t.title AS title, t.date || COALESCE(' · ' || t.kind, '') AS sub, "
+                  + _hay("t.title", "t.kind", "t.notes", "i.name") + " AS hay FROM key_dates t LEFT JOIN issuers i ON i.id=t.issuer_id"),
+    "interactions": ("Notes & interactions", "SELECT t.id, p.name || ' · ' || COALESCE(t.type, 'Note') AS title, "
+                     "t.date || ' · ' || substr(COALESCE(t.notes, ''), 1, 90) AS sub, "
+                     + _hay("t.notes", "t.type", "p.name") + " AS hay FROM interactions t JOIN people p ON p.id=t.person_id"),
+}
+
+
+def search(conn, query, limit=6):
+    terms = [t for t in re.split(r"\s+", (query or "").lower().strip()) if t]
+    if not terms:
+        return {"q": query or "", "groups": [], "total": 0}
+    esc = lambda t: t.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    groups, total = [], 0
+    for entity, (label, base) in SEARCH.items():
+        sql = (f"SELECT id, title, sub FROM ({base}) WHERE " + " AND ".join("hay LIKE ? ESCAPE '\\'" for _ in terms)
+               + " ORDER BY (lower(title) LIKE ? ESCAPE '\\') DESC, title COLLATE NOCASE LIMIT ?")
+        rows = [dict(r) for r in conn.execute(sql, [f"%{esc(t)}%" for t in terms] + [f"{esc(terms[0])}%", limit])]
+        if rows:
+            groups.append({"entity": entity, "label": label, "results": rows})
+            total += len(rows)
+    return {"q": query, "groups": groups, "total": total}
+
+
+# ----------------------------------------------------------------------- reports
+ACTIVE_SQL = "d.stage NOT IN ('Closed','Lost','On Hold')"
+
+
+def _quarter(date_str):
+    p = parse_ymd(date_str)
+    return f"{p[0]} Q{(p[1] - 1) // 3 + 1}" if p else "No date"
+
+
+def reports(conn, today):
+    out = {"pipeline": pipeline_summary(conn)}
+    out["by_sector"] = [dict(r) for r in conn.execute(
+        "SELECT COALESCE(i.sector,'No issuer') AS label, COUNT(*) AS count, COALESCE(SUM(d.par),0) AS par, "
+        "COALESCE(SUM(d.par*COALESCE(d.probability,0)/100.0),0) AS weighted FROM deals d "
+        f"LEFT JOIN issuers i ON i.id=d.issuer_id WHERE {ACTIVE_SQL} GROUP BY label ORDER BY par DESC")]
+    q = {}
+    for r in conn.execute(f"SELECT d.expected_date, d.par, d.probability FROM deals d WHERE {ACTIVE_SQL}"):
+        b = q.setdefault(_quarter(r["expected_date"]), {"label": _quarter(r["expected_date"]), "count": 0, "par": 0, "weighted": 0})
+        b["count"] += 1
+        b["par"] += r["par"] or 0
+        b["weighted"] += (r["par"] or 0) * (r["probability"] or 0) / 100
+    out["by_quarter"] = sorted(q.values(), key=lambda b: (b["label"] == "No date", b["label"]))
+    years = {}
+    for r in conn.execute("SELECT substr(COALESCE(closed_date, expected_date),1,4) AS year, stage, COUNT(*) AS n, "
+                          "COALESCE(SUM(par),0) AS par FROM deals WHERE stage IN ('Closed','Lost') GROUP BY year, stage"):
+        y = years.setdefault(r["year"] or "Undated", {"label": r["year"] or "Undated", "closed_count": 0, "closed_par": 0,
+                                                      "lost_count": 0, "lost_par": 0})
+        key = "closed" if r["stage"] == "Closed" else "lost"
+        y[f"{key}_count"] += r["n"]
+        y[f"{key}_par"] += r["par"]
+    out["outcomes"] = sorted(years.values(), key=lambda y: y["label"])
+    won, lost = sum(y["closed_count"] for y in years.values()), sum(y["lost_count"] for y in years.values())
+    month = today.strftime("%Y-%m")
+    months = []
+    for i in range(11, -1, -1):
+        y, m = divmod(today.year * 12 + today.month - 1 - i, 12)
+        months.append(f"{y}-{m + 1:02d}")
+    counts = {r["m"]: r["n"] for r in conn.execute("SELECT substr(date,1,7) AS m, COUNT(*) AS n FROM interactions GROUP BY m")}
+    out["activity"] = [{"label": m, "count": counts.get(m, 0)} for m in months]
+    stale = []
+    for r in conn.execute(
+            "SELECT i.id, i.name, i.sector, i.primary_banker, "
+            "(SELECT MAX(p.last_contact) FROM people p JOIN person_issuers l ON l.person_id=p.id WHERE l.issuer_id=i.id) AS last_contact, "
+            "(SELECT COUNT(*) FROM person_issuers l WHERE l.issuer_id=i.id) AS n_people, "
+            f"(SELECT COUNT(*) FROM deals d WHERE d.issuer_id=i.id AND {ACTIVE_SQL}) AS n_active, "
+            f"(SELECT COALESCE(SUM(d.par),0) FROM deals d WHERE d.issuer_id=i.id AND {ACTIVE_SQL}) AS active_par FROM issuers i"):
+        lc = to_date(r["last_contact"])
+        days = (today - lc).days if lc else None
+        if (r["n_active"] or r["n_people"]) and (days is None or days >= STALE_DAYS):
+            stale.append({**dict(r), "days": days})
+    stale.sort(key=lambda r: (r["n_active"] == 0, -(r["days"] if r["days"] is not None else 99999)))
+    out["stale"] = stale[:12]
+    out["stale_days"] = STALE_DAYS
+    p = out["pipeline"]
+    out["kpis"] = {
+        "active_par": sum(v["active_par"] for v in p.values()), "weighted_par": sum(v["weighted_par"] for v in p.values()),
+        "closed_ytd_par": conn.execute("SELECT COALESCE(SUM(par),0) FROM deals WHERE stage='Closed' AND "
+                                       "substr(COALESCE(closed_date, expected_date),1,4)=?", (str(today.year),)).fetchone()[0],
+        "win_rate": round(100 * won / (won + lost)) if won + lost else None, "won": won, "lost": lost,
+        "open_tasks": conn.execute("SELECT COUNT(*) FROM tasks WHERE done=0").fetchone()[0],
+        "overdue_followups": len(overdue_followups(conn, today)), "this_month_contacts": counts.get(month, 0)}
+    return out
+
+
+STALE_DAYS = 60
+_Q = "COALESCE(substr(d.expected_date,1,4) || '-Q' || ((CAST(substr(d.expected_date,6,2) AS INTEGER) + 2) / 3), '(no date)')"
+REPORT_GROUPS = {
+    "deals": {"stage": "d.stage", "pipeline": "d.pipeline", "sector": "COALESCE(i.sector,'(no issuer)')",
+              "issuer": "COALESCE(i.name,'(no issuer)')", "purpose": "COALESCE(d.purpose,'(not set)')",
+              "security": "COALESCE(d.security_type,'(not set)')", "role": "COALESCE(d.role,'(not set)')",
+              "ma": "COALESCE(d.ma_name,'(not set)')", "bond_counsel": "COALESCE(d.bond_counsel,'(not set)')",
+              "trustee": "COALESCE(d.trustee,'(not set)')", "year": "COALESCE(substr(d.expected_date,1,4),'(no date)')",
+              "quarter": _Q, "probability": "COALESCE(CAST(d.probability AS TEXT) || '%','(not set)')"},
+    "people": {"priority": None, "group": None, "sector": None, "issuer": None},
+    "issuers": {"sector": "COALESCE(sector,'(not set)')", "state": "COALESCE(state,'(not set)')",
+                "primary_banker": "COALESCE(primary_banker,'(not set)')",
+                "coverage": "COALESCE(our_coverage_banker,'(not set)')", "fiscal_year_end": "COALESCE(fiscal_year_end,'(not set)')"},
+}
+NATURAL_ORDER = {"stage", "year", "quarter", "priority", "pipeline", "probability", "fiscal_year_end"}
+
+
+def custom_report(conn, q):
+    entity, group = q.get("entity", "deals"), q.get("group", "")
+    if entity not in REPORT_GROUPS or group not in REPORT_GROUPS[entity]:
+        raise ValueError("unknown entity or grouping")
+    measure = q.get("measure", "count")
+    if measure not in ("count", "par", "weighted") or (entity != "deals" and measure != "count"):
+        raise ValueError("unknown measure for this entity")
+    rows = {}
+
+    def add(label, par=0, weighted=0):
+        r = rows.setdefault(label, {"label": label, "count": 0, "par": 0, "weighted": 0})
+        r["count"] += 1
+        r["par"] += par or 0
+        r["weighted"] += weighted or 0
+
+    if entity == "deals":
+        where = [ACTIVE_SQL] if q.get("active", "1") == "1" else []
+        args = []
+        if q.get("pipeline") in STAGES:
+            where.append("d.pipeline=?"); args.append(q["pipeline"])
+        sql = (f"SELECT {REPORT_GROUPS['deals'][group]} AS label, d.par, d.probability FROM deals d "
+               "LEFT JOIN issuers i ON i.id=d.issuer_id" + (" WHERE " + " AND ".join(where) if where else ""))
+        for r in conn.execute(sql, args):
+            add(r["label"], r["par"], (r["par"] or 0) * (r["probability"] or 0) / 100)
+    elif entity == "issuers":
+        for r in conn.execute(f"SELECT {REPORT_GROUPS['issuers'][group]} AS label FROM issuers"):
+            add(r["label"])
+    else:
+        for p in list_rows(conn, "people"):
+            if group == "priority":
+                add(p["priority"] or "C")
+            elif group == "group":
+                gs = {g for l in p["links"] for g in l["groups"]}
+                for g in (sorted(gs) or ["(none)"]):
+                    add(g)
+            elif group == "issuer":
+                add(p["issuer_name"] or p["developer_name"] or "(none)")
+            else:
+                sec = conn.execute("SELECT sector FROM issuers WHERE id=?", (p["issuer_id"],)).fetchone() if p["issuer_id"] else None
+                add(sec["sector"] if sec else "(none)")
+    key = "count" if measure == "count" else measure
+    if group in NATURAL_ORDER:
+        order = {s: i for i, s in enumerate(dict.fromkeys(STAGES["standard"] + STAGES["developer"]))}
+        out = sorted(rows.values(), key=lambda r: (order.get(r["label"], 0) if group == "stage" else 0, r["label"]))
+    else:
+        out = sorted(rows.values(), key=lambda r: (-r[key], r["label"]))
+    for r in out:
+        r["value"] = r[key]
+    return {"entity": entity, "group": group, "measure": measure, "rows": out, "total": sum(r["value"] for r in out)}
 
 
 # ------------------------------------------------------------------------ dates
@@ -389,6 +704,12 @@ def build_events(conn, today, window, start=None, end=None):
         spouse = f" & {p['spouse']}" if p["spouse"] else ""
         add(p["anniversary"], True, "Anniversary", f"{p['name']}{spouse}: anniversary", org, link)
 
+    for t in conn.execute("SELECT t.*, p.name AS person_name, i.name AS issuer_name FROM tasks t "
+                          "LEFT JOIN people p ON p.id=t.person_id LEFT JOIN issuers i ON i.id=t.issuer_id "
+                          "WHERE t.done=0 AND t.due_date IS NOT NULL"):
+        add(t["due_date"], False, "Task", t["title"], t["person_name"] or t["issuer_name"],
+            {"entity": "tasks", "id": t["id"]})
+
     for d in conn.execute("SELECT d.*, i.name AS issuer_name FROM deals d LEFT JOIN issuers i ON i.id=d.issuer_id "
                           "WHERE d.stage NOT IN ('Closed','Lost','On Hold')"):
         link = {"entity": "deals", "id": d["id"]}
@@ -444,8 +765,11 @@ def dashboard(conn, today):
             "overdue": overdue_followups(conn, today),
             "events": build_events(conn, today, window),
             "pipeline": pipeline_summary(conn),
-            "stats": {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
-                      for t in ("issuers", "people", "developers", "projects")}}
+            "tasks": tasks_due(conn, today),
+            "activity": timeline(conn, limit=8),
+            "stats": {**{t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                         for t in ("issuers", "people", "developers", "projects")},
+                      "open_tasks": conn.execute("SELECT COUNT(*) FROM tasks WHERE done=0").fetchone()[0]}}
 
 
 # ----------------------------------------------------------------------- digest
@@ -468,6 +792,17 @@ def build_digest(conn, today):
         parts.append("</table>")
     else:
         parts.append("<p>None. You're caught up.</p>")
+    tasks = tasks_due(conn, today, window)
+    parts.append(f"<h3>Tasks due or overdue ({len(tasks)})</h3>")
+    if tasks:
+        parts.append("<table style='border-collapse:collapse;width:100%'>")
+        for t in tasks:
+            when = f"{-t['days']} days overdue" if t["days"] < 0 else ("due today" if t["days"] == 0 else f"due in {t['days']}d")
+            parts.append(f"<tr><td style='{th}'><b>{e(t['title'])}</b></td><td style='{th}'>{e(t['person_name'] or t['issuer_name'] or '')}</td>"
+                         f"<td style='{th}'>{when}</td></tr>")
+        parts.append("</table>")
+    else:
+        parts.append("<p>No tasks due.</p>")
     parts.append(f"<h3>Next {window} days</h3>")
     if events:
         parts.append("<table style='border-collapse:collapse;width:100%'>")
@@ -486,6 +821,8 @@ def build_digest(conn, today):
     parts.append("</ul></div>")
     text = [f"Weekly CRM digest, {today:%A, %B %d, %Y}", "", f"OVERDUE FOLLOW-UPS ({len(overdue)})"]
     text += [f"  - {r['name']} ({r['issuer_name'] or ''}) {r['priority']}: {r['days_overdue']}d overdue" for r in overdue]
+    text += ["", f"TASKS DUE OR OVERDUE ({len(tasks)})"]
+    text += [f"  - {t['title']} ({t['person_name'] or t['issuer_name'] or ''}) due {t['due_date']}" for t in tasks]
     text += ["", f"NEXT {window} DAYS"]
     text += [f"  - {ev['date']} [{ev['kind']}] {ev['title']} {ev['detail']}" for ev in events]
     return "".join(parts), "\n".join(text)
@@ -709,6 +1046,63 @@ def seed_demo(conn):
     set_links(conn, gomez, [{"issuer_id": city, "groups": ["Elected"]}, {"issuer_id": county, "groups": ["Related"]}])
     both = P(name="Harold Finch", title="Finance Committee Chair / City Treasurer", priority="B", last_contact=D(-50))
     set_links(conn, both, [{"issuer_id": city, "groups": ["Elected", "Staff"]}])
+
+    # ---- tasks, history, past outcomes and saved views (feed the new tasks / timeline / reports / search features)
+    pid = lambda n: conn.execute("SELECT id FROM people WHERE name=?", (n,)).fetchone()[0]
+    did = lambda n: conn.execute("SELECT id FROM deals WHERE name=?", (n,)).fetchone()[0]
+    T = lambda title, due, **kw: ins("tasks", title=title, due_date=D(due) if due is not None else None, **kw)
+    T("Send refunding savings analysis to Helen Okafor", 3, priority="High", person_id=pid("Helen Okafor"),
+      issuer_id=city, deal_id=did("Riverbend GO Refunding"))
+    T("Call Cedar Valley ISD CFO before the RFP is due", 9, priority="High", person_id=pid("Greg Hollis"),
+      issuer_id=isd, deal_id=did("Cedar Valley ISD 2027 Bond"))
+    T("Update internal committee memo: Harborview Phase 1", 6, deal_id=did("Harborview Phase 1 Assessment Bonds"), issuer_id=mud)
+    T("Introduce Priya Natarajan (MA) to the County Auditor", -2, person_id=pid("Sue Lindqvist"), issuer_id=county)
+    T("Prep pitch book for Lakeshore rate study meeting", 15, issuer_id=util, priority="High")
+    T("Send holiday cards to A-list contacts", 60)
+    ins("tasks", title="Send intro deck to Westbrook CCD", due_date=D(-10), done=1, done_at=D(-11),
+        person_id=pid("Nina Castellano"), issuer_id=cc)
+    for name, issuer, stage, par, closed, pipeline in [
+            ("Westbrook CCD 2024 Refunding", cc, "Closed", 44000000, D(-470), "standard"),
+            ("Riverbend Utility Revenue Refunding", city, "Closed", 38000000, D(-330), "standard"),
+            ("Prairie STEM Series 2025", charter, "Lost", 12000000, D(-300), "standard"),
+            ("Cedar Valley ISD 2025 Bond Series A", isd, "Closed", 72000000, D(-250), "standard"),
+            ("Maple County Certificates of Obligation", county, "Closed", 24500000, D(-160), "standard"),
+            ("Lakeshore Water Refunding", util, "Closed", 31000000, D(-80), "standard"),
+            ("St. Anselm Facilities Loan", prep, "Lost", 9500000, D(-45), "standard"),
+            ("Harborview Phase 0 Assessment Bonds", mud, "Closed", 8200000, D(-200), "developer")]:
+        ins("deals", name=name, pipeline=pipeline, stage=stage, issuer_id=issuer, par=par, closed_date=closed,
+            expected_date=closed, security_type="GO" if issuer in (isd, cc, county, city) else "Revenue",
+            purpose="Refunding" if "Refunding" in name else "New Money", role="Senior Manager")
+    LA = lambda kind, text, off, **kw: log_activity(conn, kind, text, date=D(off), **kw)
+    cv = did("Cedar Valley ISD 2027 Bond")
+    LA("Deal", "Financing added: Cedar Valley ISD 2027 Bond (Idea)", -110, issuer_id=isd, deal_id=cv)
+    LA("Deal", "Cedar Valley ISD 2027 Bond: stage Idea \u2192 Initial Conversation", -80, issuer_id=isd, deal_id=cv)
+    LA("Deal", "Cedar Valley ISD 2027 Bond: stage Initial Conversation \u2192 Proposal / RFP", -25, issuer_id=isd, deal_id=cv)
+    lk = did("Lakeshore Water Revenue Bonds")
+    LA("Deal", "Financing added: Lakeshore Water Revenue Bonds (Idea)", -70, issuer_id=util, deal_id=lk)
+    LA("Deal", "Lakeshore Water Revenue Bonds: stage Idea \u2192 Structuring", -30, issuer_id=util, deal_id=lk)
+    rv = did("Riverbend GO Refunding")
+    LA("Deal", "Financing added: Riverbend GO Refunding (Initial Conversation)", -50, issuer_id=city, deal_id=rv)
+    LA("Date", "Date moved: City of Riverbend: budget adoption " + D(26) + " \u2192 " + D(33), -12, issuer_id=city)
+    LA("Task", "Task completed: Send intro deck to Westbrook CCD", -11, issuer_id=cc, person_id=pid("Nina Castellano"))
+    for who, issuer, off, typ, note in [
+            ("Helen Okafor", city, -12, "Call", "Walked through savings on the 2016 GO. She wants a one-page analysis."),
+            ("Greg Hollis", isd, -20, "Meeting", "Lunch with CFO. Board is leaning toward a fall election."),
+            ("Dr. Renee Park", isd, -60, "Email", "Sent enrollment-growth article. Quick thank-you reply."),
+            ("Omar Haddad", util, -30, "Call", "Rate study kickoff. Wants us at the January board meeting."),
+            ("Sue Lindqvist", county, -8, "Call", "Auditor asked about taking out the 2019 CO early."),
+            ("Nina Castellano", cc, -95, "Meeting", "Campus tour. Housing project is the next capital need."),
+            ("Carla Dunn", mud, -15, "Call", "Phase 1 bonds timing, waiting on validation."),
+            ("Luis Moreno", charter, -70, "Email", "Charter renewal timeline and facilities plans."),
+            ("Dana Whitfield", city, -200, "Event", "Chamber luncheon. Brief hello."),
+            ("Marcus Ellery", city, -150, "Meeting", "Budget workshop observer."),
+            ("Greg Hollis", isd, -240, "Call", "Post-pricing debrief on the Series A deal."),
+            ("Helen Okafor", city, -310, "Email", "Congratulated on the utility refunding closing.")]:
+        ins("interactions", person_id=pid(who), issuer_id=issuer, date=D(off), type=typ, notes=note)
+    for page, name, state in [("issuers", "Cities & counties with active deals", {"sector": "City", "active": True}),
+                              ("people", "Elected officials", {"group": "Elected"}),
+                              ("deals-standard", "RFPs in play", {"stage": "Proposal / RFP"})]:
+        ins("saved_views", page=page, name=name, state=json.dumps(state))
     conn.commit()
     return True
 
@@ -733,6 +1127,15 @@ def route_api(conn, method, parts, q, body, today):
                 raise ValueError("start and end must be YYYY-MM-DD dates, at most 400 days apart")
             return _json(200, build_events(conn, today, 0, start, end))
         return _json(200, build_events(conn, today, int(q.get("window", 30))))
+    if method == "GET" and head == "timeline":
+        return _json(200, timeline(conn, int(q["issuer_id"]) if q.get("issuer_id") else None,
+                                   int(q["person_id"]) if q.get("person_id") else None, int(q.get("limit", 100))))
+    if method == "GET" and head == "search":
+        return _json(200, search(conn, q.get("q", ""), int(q.get("limit", 6))))
+    if method == "GET" and head == "reports":
+        return _json(200, reports(conn, today))
+    if method == "GET" and head == "report":
+        return _json(200, custom_report(conn, q))
     if method == "GET" and head == "digest.html":
         return 200, build_digest(conn, today)[0], "text/html; charset=utf-8", {}
     if method == "GET" and head == "backup":
@@ -781,6 +1184,8 @@ def handle_api(method, raw_path, body="", today=None):
     u = urlparse(raw_path)
     q = {k: v[0] for k, v in parse_qs(u.query).items()}
     parts = [p for p in u.path.split("/api/", 1)[-1].split("/") if p]
+    global CURRENT_DATE
+    CURRENT_DATE = today
     conn = connect()
     try:
         return route_api(conn, method, parts, q, body, today or dt.date.today())
@@ -794,6 +1199,7 @@ def handle_api(method, raw_path, body="", today=None):
     except Exception as e:  # pragma: no cover
         return _json(500, {"error": f"{type(e).__name__}: {e}"})
     finally:
+        CURRENT_DATE = None
         conn.close()
 
 

@@ -104,6 +104,7 @@ const ENT = {
       F("par", "Estimated par ($)", "number"), F("role", "Our role", "select", { options: ["Senior Manager", "Co-Manager", "Underwriter", "Placement Agent", "Other"] }),
       F("probability", "Probability", "select", { options: ["10", "25", "40", "50", "60", "75", "90", "100"] }),
       F("expected_date", "Expected pricing date", "date"), F("rfp_deadline", "RFP deadline", "date"),
+      F("closed_date", "Closed / lost date (set automatically)", "date"),
       F("ma_name", "Municipal advisor"), F("bond_counsel", "Bond counsel"), F("trustee", "Trustee"),
       F("competing_banks", "Competing banks"), F("notes", "Notes", "textarea", { full: 1 })],
     cols: () => [{ h: "Financing", v: r => editLink("deals", r.id, r.name), s: r => r.name.toLowerCase() },
@@ -111,6 +112,19 @@ const ENT = {
       { h: "Issuer / project", v: r => esc(r.project_name ? `${r.project_name}${r.issuer_name ? " / " + r.issuer_name : ""}` : r.issuer_name) },
       { h: "Par", v: r => money(r.par), s: r => r.par || 0 }, { h: "Expected", v: r => fdate(r.expected_date), s: r => r.expected_date || "9" },
       { h: "RFP due", v: r => fdate(r.rfp_deadline), s: r => r.rfp_deadline || "9" }],
+  },
+  tasks: {
+    label: "Task", plural: "Tasks", detail: false, title: r => r.title,
+    fields: [F("title", "Task", "text", { req: 1, full: 1 }), F("due_date", "Due date", "date"),
+      F("priority", "Priority", "select", { options: ["Normal", "High"], req: 1 }),
+      F("person_id", "Person", "ref", { ref: "people" }), F("issuer_id", "Issuer", "ref", { ref: "issuers" }),
+      F("deal_id", "Financing", "ref", { ref: "deals" }), F("done", "Done", "bool"), F("notes", "Notes", "textarea", { full: 1 })],
+    cols: () => [
+      { h: "", v: r => `<input type="checkbox" data-done="${r.id}" ${r.done ? "checked" : ""} aria-label="Mark done">`, s: r => r.done },
+      { h: "Task", v: r => `<span class="${r.done ? "done" : ""}">${editLink("tasks", r.id, r.title)}</span>${r.priority === "High" ? " " + chip("High", "warn") : ""}`, s: r => r.title.toLowerCase() },
+      { h: "Due", v: r => r.due_date ? chip(fdate(r.due_date), !r.done && r.due_date < todayISO() ? "bad" : "") : "", s: r => r.due_date || "9" },
+      { h: "Related", v: r => [r.person_id && link("people", r.person_id, r.person_name), r.issuer_id && link("issuers", r.issuer_id, r.issuer_name), r.deal_name && esc(r.deal_name)].filter(Boolean).join(" · "), s: r => r.person_name || r.issuer_name || "" },
+      { h: "Priority", v: r => r.priority === "High" ? chip("High", "warn") : '<span class="muted">Normal</span>', s: r => r.priority === "High" ? 0 : 1 }],
   },
   key_dates: {
     label: "Date", plural: "Key dates", detail: false, title: r => r.title,
@@ -146,10 +160,12 @@ const RELATED = {
     { title: "Financings", entity: "deals", key: "issuer_id", pick: ["Financing", "Stage", "Par", "Expected", "RFP due"] },
     { title: "Developer projects behind this issuer", entity: "projects", key: "issuer_id", pick: ["Project", "Developer", "Structure", "Est. par"], noAdd: 1, hideIfEmpty: 1 },
     { title: "Key dates", entity: "key_dates", key: "issuer_id", pick: ["Date", "Title", "Type", ""] },
-    { title: "Recent interactions", entity: "interactions", key: "issuer_id", pick: ["Date", "Type", "Person", "Notes"], noAdd: 1 },
+    { title: "Open tasks", entity: "tasks", key: "issuer_id", query: "&done=0", pick: ["", "Task", "Due", "Priority"], hideIfEmpty: 1 },
+    { title: "Timeline", entity: "interactions", key: "issuer_id", timeline: "issuer_id", noAdd: 1 },
   ],
   people: [
-    { title: "Interactions", entity: "interactions", key: "person_id", pick: ["Date", "Type", "Notes"], addLabel: "Log interaction" },
+    { title: "Open tasks", entity: "tasks", key: "person_id", query: "&done=0", pick: ["", "Task", "Due", "Priority"] },
+    { title: "Timeline", entity: "interactions", key: "person_id", timeline: "person_id", addLabel: "Log interaction" },
     { title: "Direct reports", entity: "people", key: "reports_to_id", pick: ["Name", "Title", "Last contact"], noAdd: 1 },
   ],
   developers: [
@@ -179,17 +195,18 @@ function sortable(root, cols, rows) {
   }));
 }
 
+const EDIT_ONLY = ["deals", "tasks"];  // records without a detail page open their edit form instead
 function eventRow(e) {
   const cls = e.days < 0 ? "bad" : e.reminder ? "warn" : "";
-  const title = e.link ? (e.link.entity === "deals" ? editLink("deals", e.link.id, e.title) : link(e.link.entity, e.link.id, e.title)) : esc(e.title);
+  const title = e.link ? (EDIT_ONLY.includes(e.link.entity) ? editLink(e.link.entity, e.link.id, e.title) : link(e.link.entity, e.link.id, e.title)) : esc(e.title);
   return `<tr><td>${fdate(e.date)}</td><td>${chip(whenText(e.days), cls)}</td><td>${chip(e.kind)}</td><td>${title}</td><td class="muted">${esc(e.detail)}</td></tr>`;
 }
 const eventsTable = (evs, empty) => evs.length ? `<div class="tablewrap"><table><tbody>${evs.map(eventRow).join("")}</tbody></table></div>` : `<div class="empty">${empty}</div>`;
 
 // ------------------------------------------------- list / calendar toggle
 const KIND_CLASS = { "Election": "k-elec", "Bond Election": "k-elec", "Budget Adoption": "k-budget", "Fiscal Year End": "k-budget",
-  "Term Expiration": "k-term", "RFP Deadline": "k-deal", "Expected Pricing": "k-deal", "Birthday": "k-personal", "Anniversary": "k-personal" };
-const LEGEND = [["k-elec", "Elections"], ["k-budget", "Budget / fiscal year"], ["k-term", "Terms"], ["k-deal", "RFPs & pricing"], ["k-personal", "Birthdays & anniversaries"], ["k-other", "Other"]];
+  "Term Expiration": "k-term", "RFP Deadline": "k-deal", "Expected Pricing": "k-deal", "Birthday": "k-personal", "Anniversary": "k-personal", "Task": "k-task" };
+const LEGEND = [["k-elec", "Elections"], ["k-budget", "Budget / fiscal year"], ["k-term", "Terms"], ["k-deal", "RFPs & pricing"], ["k-personal", "Birthdays & anniversaries"], ["k-task", "Tasks"], ["k-other", "Other"]];
 const pad2 = n => String(n).padStart(2, "0");
 const isoDate = d => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
 const store = { get: k => { try { return localStorage.getItem(k); } catch { return null; } }, set: (k, v) => { try { localStorage.setItem(k, v); } catch { } } };
@@ -197,7 +214,7 @@ const store = { get: k => { try { return localStorage.getItem(k); } catch { retu
 function evAnchor(e, cls, text) {
   const t = esc(`${e.title}${e.detail ? " · " + e.detail : ""}`), l = e.link;
   if (!l) return `<span class="${cls}" title="${t}">${esc(text)}</span>`;
-  if (l.entity === "deals") return `<a class="${cls}" href="#" data-edit="deals:${l.id}" title="${t}">${esc(text)}</a>`;
+  if (EDIT_ONLY.includes(l.entity)) return `<a class="${cls}" href="#" data-edit="${l.entity}:${l.id}" title="${t}">${esc(text)}</a>`;
   return `<a class="${cls}" href="#/${l.entity}/${l.id}" title="${t}">${esc(text)}</a>`;
 }
 
@@ -270,32 +287,50 @@ pages.dashboard = async main => {
     <td>${fdate(r.last_contact) || '<span class="muted">never</span>'}</td><td>${chip(r.days_overdue ? `${r.days_overdue}d overdue` : "due today", "bad")}<div class="muted">${esc(r.why)}</div></td>
     <td><button class="btn sm" data-log="${r.id}">Log contact</button></td></tr>`).join("");
   main.innerHTML = `<div class="head"><div><h1>Dashboard</h1><div class="sub">${new Date().toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric", year: "numeric" })}</div></div></div>
-    <div class="stats">${Object.entries(d.stats).map(([k, v]) => `<div class="stat"><b>${v}</b><span>${k}</span></div>`).join("")}</div>
+    <div class="stats">${Object.entries(d.stats).map(([k, v]) => `<div class="stat"><b>${v}</b><span>${k.replace("_", " ")}</span></div>`).join("")}</div>
     <div class="panel"><div class="head"><h2>Overdue follow-ups (${d.overdue.length})</h2></div>
       ${od ? `<div class="tablewrap"><table><thead><tr><th>Contact</th><th>Organization</th><th>Pri</th><th>Last contact</th><th>Status</th><th></th></tr></thead><tbody>${od}</tbody></table></div>` : `<div class="empty">You're caught up.</div>`}</div>
+    <div class="panel"><div class="head"><h2>Tasks due (${d.tasks.length})</h2><div><a href="#/tasks" style="margin-right:12px">All tasks →</a><button class="btn sm" data-add="tasks">+ Add task</button></div></div>
+      ${dashTasksHTML(d.tasks)}</div>
     <div class="panel"><div class="head"><h2>Dates &amp; reminders</h2><div><a href="#/dates" style="margin-right:12px">All dates →</a><span class="seg" id="seg-dash"></span></div></div>
       <div id="body-dash"></div></div>
-    <div class="grid2">${pipe("standard", "Issuer financings")}${pipe("developer", "Developer deals")}</div>`;
+    <div class="grid2">${pipe("standard", "Issuer financings")}${pipe("developer", "Developer deals")}</div>
+    <div class="panel"><div class="head"><h2>Recent activity</h2></div>${timelineHTML(d.activity, "Nothing logged yet.")}</div>`;
   await mountEventsView($("#seg-dash"), $("#body-dash"), "dashboard",
     async () => `<div class="muted" style="margin-bottom:6px">Next ${d.window} days</div>${eventsTable(d.events, "Nothing coming up.")}`);
 };
 
-async function listPage(main, entity, opts = {}) {
+async function listPage(main, entity) {
   const E = ENT[entity];
   const rows = await api("GET", "/" + entity);
   const cols = E.cols();
-  const sectorFilter = entity === "issuers" ? `<select id="f-sector"><option value="">All sectors</option>${META.sectors.map(s => `<option>${esc(s)}</option>`).join("")}</select>` : "";
+  const sel = (id, label, opts) => `<select id="${id}"><option value="">${label}</option>${opts.map(o => `<option>${esc(o)}</option>`).join("")}</select>`;
+  const filters = { issuers: sel("f-sector", "All sectors", META.sectors) + '<label class="chk"><input type="checkbox" id="f-active"> Has active deals</label>',
+    people: sel("f-group", "All groups", META.groups) + sel("f-pri", "All priorities", ["A", "B", "C"]) }[entity] || "";
   main.innerHTML = `<div class="head"><div><h1>${E.plural}</h1><div class="sub" id="count"></div></div>
     <button class="btn primary" data-add="${entity}">+ Add ${E.label.toLowerCase()}</button></div>
-    <div class="toolbar"><input id="q" placeholder="Search..." type="search">${sectorFilter}</div><div class="panel" id="tbl"></div>`;
+    <div class="toolbar"><input id="q" placeholder="Search..." type="search">${filters}<span class="views" id="views"></span></div><div class="panel" id="tbl"></div>`;
+  const val = id => $(id)?.value || "";
   const draw = () => {
-    const q = $("#q").value.toLowerCase(), sec = $("#f-sector")?.value;
-    const shown = rows.filter(r => (!sec || r.sector === sec) && (!q || JSON.stringify(Object.values(r)).toLowerCase().includes(q)));
+    const q = val("#q").toLowerCase(), sec = val("#f-sector"), grp = val("#f-group"), pri = val("#f-pri"), act = $("#f-active")?.checked;
+    const shown = rows.filter(r => (!sec || r.sector === sec) && (!act || r.n_active_deals > 0) && (!pri || r.priority === pri)
+      && (!grp || r.links.some(l => l.groups.includes(grp))) && (!q || JSON.stringify(Object.values(r)).toLowerCase().includes(q)));
     $("#tbl").innerHTML = table(cols, shown, "No matches.");
     $("#count").textContent = `${shown.length} of ${rows.length}`;
     sortable($("#tbl"), cols, shown);
   };
-  $("#q").addEventListener("input", draw); $("#f-sector")?.addEventListener("change", draw); draw();
+  main.querySelectorAll(".toolbar input, .toolbar select").forEach(el => el.addEventListener(el.type === "search" ? "input" : "change", draw));
+  draw();
+  const state = () => ({ q: val("#q"), sector: val("#f-sector"), group: val("#f-group"), pri: val("#f-pri"), active: !!$("#f-active")?.checked });
+  const apply = st => {
+    if ($("#q")) $("#q").value = st.q || "";
+    if ($("#f-sector")) $("#f-sector").value = st.sector || "";
+    if ($("#f-group")) $("#f-group").value = st.group || "";
+    if ($("#f-pri")) $("#f-pri").value = st.pri || "";
+    if ($("#f-active")) $("#f-active").checked = !!st.active;
+    draw();
+  };
+  await mountViews($("#views"), entity, state, apply);
 }
 
 async function detailPage(main, entity, id) {
@@ -322,14 +357,16 @@ async function detailPage(main, entity, id) {
     if (sec.group) {  // people at this issuer, split by group; a person tagged to several groups appears in each
       atIssuer ??= await api("GET", `/people?linked_issuer=${id}`);
       data = atIssuer.filter(p => sec.group === "Ungrouped" ? !p.groups.length : p.groups.includes(sec.group));
-    } else data = await api("GET", `/${sec.entity}?${sec.key}=${id}`);
+    } else if (sec.timeline) data = await api("GET", `/timeline?${sec.timeline}=${id}`);
+    else data = await api("GET", `/${sec.entity}?${sec.key}=${id}${sec.query || ""}`);
     if (sec.hideIfEmpty && !data.length) continue;
-    const cols = E2.cols().filter(c => sec.pick.includes(c.h));
+    const cols = sec.timeline ? null : E2.cols().filter(c => sec.pick.includes(c.h));
     const prefill = sec.group ? { links: [{ issuer_id: +id, groups: [sec.group] }] } : { [sec.key]: +id, ...(sec.prefill || {}) };
     if (entity === "projects" && r.issuer_id) prefill.issuer_id = r.issuer_id;
     if (entity === "people" && sec.entity === "interactions") prefill.person_id = +id;
+    if (sec.entity === "tasks") Object.assign(prefill, entity === "people" ? { person_id: +id } : { issuer_id: +id });
     const div = document.createElement("div"); div.className = "panel";
-    div.innerHTML = `<div class="head"><h2>${sec.title} (${data.length})</h2>${sec.noAdd ? "" : `<button class="btn sm" data-add="${sec.entity}" data-prefill='${esc(JSON.stringify(prefill))}'>+ ${sec.addLabel || "Add"}</button>`}</div>${table(cols, data)}`;
+    div.innerHTML = `<div class="head"><h2>${sec.title} (${data.length})</h2>${sec.noAdd ? "" : `<button class="btn sm" data-add="${sec.entity}" data-prefill='${esc(JSON.stringify(prefill))}'>+ ${sec.addLabel || "Add"}</button>`}</div>${sec.timeline ? timelineHTML(data) : table(cols, data)}`;
     $("#related").appendChild(div);
   }
 }
@@ -355,7 +392,7 @@ pages.deals = async (main, which) => {
     <a class="btn ${pl === "developer" ? "active" : ""}" href="#/deals/developer">Developer deals</a></div>
     <div class="toolbar"><input id="q" type="search" placeholder="Search..."><select id="f-stage">
       <option value="active">Active (hide closed / lost / on hold)</option><option value="all">All stages</option>
-      ${stages.map(s => `<option ${s === saved ? "selected" : ""}>${esc(s)}</option>`).join("")}</select></div>
+      ${stages.map(s => `<option ${s === saved ? "selected" : ""}>${esc(s)}</option>`).join("")}</select><span class="views" id="views"></span></div>
     <div class="panel" id="tbl"></div>`;
   $("#f-stage").value = [...$("#f-stage").options].some(o => o.value === saved) ? saved : "active";
   const draw = () => {
@@ -370,6 +407,10 @@ pages.deals = async (main, which) => {
   $("#q").addEventListener("input", draw);
   $("#f-stage").addEventListener("change", () => { sessionStorage.setItem("dealfilter", $("#f-stage").value); draw(); });
   draw();
+  await mountViews($("#views"), `deals-${pl}`, () => ({ q: $("#q").value, stage: $("#f-stage").value }), st => {
+    $("#q").value = st.q || ""; $("#f-stage").value = [...$("#f-stage").options].some(o => o.value === st.stage) ? st.stage : "active";
+    sessionStorage.setItem("dealfilter", $("#f-stage").value); draw();
+  });
 };
 
 pages.dates = async main => {
@@ -522,9 +563,14 @@ document.addEventListener("click", async e => {
   } catch (err) { alert(err.message); }
 });
 document.addEventListener("change", async e => {
+  if (e.target.dataset.done) {
+    try { await api("PUT", `/tasks/${e.target.dataset.done}`, { done: e.target.checked ? 1 : 0 }); } catch (err) { alert(err.message); }
+    return route();
+  }
   if (e.target.dataset.win !== undefined) { sessionStorage.setItem("win", e.target.value); return route(); }
   if (!e.target.dataset.move) return;
   try { await api("PUT", `/deals/${e.target.dataset.move}`, { stage: e.target.value }); route(); } catch (err) { alert(err.message); route(); }
 });
 
-route();
+// features.js (loaded after this file) registers more pages, so start once every script has run.
+document.addEventListener("DOMContentLoaded", route);

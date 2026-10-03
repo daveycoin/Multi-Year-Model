@@ -24,7 +24,11 @@ Run the tests with `python3 -m unittest discover -s tests`.
 | **Developers → Projects** | Projects link to the issuer behind them (district, city, county), so an issuer page shows its developer projects. |
 | **Pipeline** | Two list views (switch with the tabs; filter by stage, sort by any column, change stage inline). Issuer financings: Idea → Initial Conversation → Structuring → Proposal / RFP → Selected → Pricing → Closed (+ Lost, On Hold). Developer deals: Developer Intro → Project Scoped → Entitlements / District Formation → Structuring → Validation → Internal Committee → Approvals → Pricing → Closed (+ Lost, On Hold). Each deal records purpose, security, par, role, probability, **MA, bond counsel, trustee**, competing banks, and **RFP deadline**. |
 | **Dates & reminders** | A **List / Calendar** toggle on both the Dashboard and the Dates page (each remembers your choice). The calendar is a month grid: color-coded by type, click a day for its details, hover a day and click **+** to add a date there, and step through any month (yearly items like birthdays and fiscal year end show in every year). Elections, bond elections, budget adoption, fiscal year end, charter renewal, rate studies, etc. (optionally yearly), each with a "start reminding N days before" lead time. Term ends, birthdays, anniversaries, RFP deadlines and expected pricing dates are pulled from your records automatically. |
-| **Dashboard** | Overdue follow-ups first, then upcoming dates and reminders, then pipeline totals (par and probability-weighted par). |
+| **Tasks** | To-dos linked to a person, issuer and/or financing, with a due date and priority. Tick them off on the dashboard or the Tasks page; open tasks appear on issuer and person pages, on the calendar, and in the weekly digest. |
+| **Activity timeline** | Every issuer and person page has a chronological feed of calls, meetings and notes plus logged changes: financing added, **stage moves** (Idea → Structuring...), tasks completed, and dates moved. The dashboard shows recent activity across everything. |
+| **Search & saved views** | The search box in the sidebar (press **/**) searches issuers, people, developers, projects, financings, tasks, dates and the text of your notes, with a full results page. Lists and reports can **save the current search and filters as a named view**. |
+| **Reports & charts** | Pipeline by stage and by issuer sector, forecast by expected pricing quarter, closed vs. lost by year with win rate, contacts logged per month, and a "relationships that need attention" list (no contact in 60+ days, active deals first). Every chart has a table view. A **report builder** groups financings, people or issuers by almost any field and exports CSV. |
+| **Dashboard** | Overdue follow-ups first, then tasks due, upcoming dates and reminders, pipeline totals (par and probability-weighted par), and recent activity. |
 | **Follow-up logic** | A contact is overdue when `last contact + cadence` (A 30 / B 90 / C 180 days, editable in Settings) has passed. A manual next-follow-up date overrides the cadence. Logging a contact updates last contact and clears a follow-up it satisfies. |
 | **CSV import** | Outlook or Excel exports. Preview first; issuers are created and sector-guessed from the organization name; duplicates are skipped. |
 | **Weekly email digest** | `python3 digest.py`. See below. |
@@ -45,12 +49,12 @@ loaded with the fictional demo data. Nothing is sent to or stored on any server,
 - **Publish:** drag the `demo-site` folder onto https://app.netlify.com/drop, or copy its contents into a
   sub-folder of an existing site (e.g. `crm-demo/`); all paths are relative, so either works.
 - **Rebuild after changing the app:** `python3 build_demo.py` (the Pyodide runtime is downloaded once, then reused).
-- It opens with a short **guided tour** (9 steps with a spotlight on each screen; viewers can skip it, restart it from the sidebar, or use the arrow keys). The tour code is `demo/demo-tour.js` and is demo-only.
+- It opens with a short **guided tour** (12 steps with a spotlight on each screen; viewers can skip it, restart it from the sidebar, or use the arrow keys). The tour code is `demo/demo-tour.js` and is demo-only.
 - First visit downloads about 6 MB (cached afterwards). Needs a current desktop browser.
 - It is not for real client data. Use the local version for that.
 
 ## Deliberately not in the proof of concept
 
-Multi-user logins and permissions, Outlook sync, outstanding-debt tracking (bond series, call dates,
+Multi-user logins and permissions, Outlook sync, file attachments, outstanding-debt tracking (bond series, call dates,
 refunding savings), and compliance logs (G-37 contributions, etc.). The schema is plain tables, so
 adding a `bonds` table linked to `issuers` is the natural next step.
