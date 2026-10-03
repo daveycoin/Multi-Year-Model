@@ -45,6 +45,7 @@ loaded with the fictional demo data. Nothing is sent to or stored on any server,
 - **Publish:** drag the `demo-site` folder onto https://app.netlify.com/drop, or copy its contents into a
   sub-folder of an existing site (e.g. `crm-demo/`); all paths are relative, so either works.
 - **Rebuild after changing the app:** `python3 build_demo.py` (the Pyodide runtime is downloaded once, then reused).
+- It opens with a short **guided tour** (9 steps with a spotlight on each screen; viewers can skip it, restart it from the sidebar, or use the arrow keys). The tour code is `demo/demo-tour.js` and is demo-only.
 - First visit downloads about 6 MB (cached afterwards). Needs a current desktop browser.
 - It is not for real client data. Use the local version for that.
 

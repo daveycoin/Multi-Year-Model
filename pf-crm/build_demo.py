@@ -54,8 +54,10 @@ def patch_index(html):
     html = sub("<body>", '<body>\n<div id="demo-loading"><div><b>Loading demo&hellip;</b>'
                          "<p>Starting the app in your browser. The first visit downloads a few MB; after that it opens quickly.</p></div></div>")
     html = sub("</nav>", '</nav>\n  <div id="demo-note"><b>DEMO</b><br>Fictional data. This runs entirely in your browser: '
-                         'nothing you enter is saved or sent anywhere. <a href="" onclick="location.reload();return false">Reset</a></div>')
-    return sub('<script src="app.js"></script>', '<script src="demo-shim.js"></script>\n<script src="app.js"></script>')
+                         'nothing you enter is saved or sent anywhere. <a href="" onclick="location.reload();return false">Reset</a>'
+                         '<a href="#" id="demo-tour-link">Take the guided tour</a></div>')
+    return sub('<script src="app.js"></script>',
+               '<script src="demo-shim.js"></script>\n<script src="app.js"></script>\n<script src="demo-tour.js"></script>')
 
 
 def main():
@@ -73,7 +75,7 @@ def main():
         index = patch_index(f.read())
     with open(os.path.join(OUT, "index.html"), "w", encoding="utf-8") as f:
         f.write(index)
-    for name in ("demo-shim.js", "demo.css"):
+    for name in ("demo-shim.js", "demo-tour.js", "demo.css"):
         shutil.copy(os.path.join(HERE, "demo", name), OUT)
     os.makedirs(os.path.join(OUT, "app"), exist_ok=True)
     shutil.copy(os.path.join(HERE, "server.py"), os.path.join(OUT, "app", "server.py"))
