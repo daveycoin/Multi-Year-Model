@@ -178,6 +178,26 @@ class CRMTests(unittest.TestCase):
         server.backfill_links(self.conn)
         self.assertEqual(server.list_rows(self.conn, "people", row_id=pid)[0]["links"][0]["groups"], ["Elected"])
 
+    def test_handle_api_round_trip(self):
+        old = server.DB_PATH
+        server.DB_PATH = os.path.join(self.tmp.name, "api.db")
+        try:
+            code, issuer, _, _ = server.handle_api("POST", "/api/issuers", '{"name": "API City", "sector": "City"}')
+            self.assertEqual(code, 201)
+            code, rows, ctype, _ = server.handle_api("GET", "/api/issuers?sector=City", today=TODAY)
+            self.assertEqual((code, ctype, [r["name"] for r in rows]), (200, "application/json", ["API City"]))
+            self.assertEqual(server.handle_api("GET", "/api/issuers/999")[0], 404)
+            self.assertEqual(server.handle_api("POST", "/api/issuers", "{}")[0], 400)   # nothing to save
+            code, err, _, _ = server.handle_api("POST", "/api/issuers", '{"state": "TX"}')
+            self.assertEqual((code, err["error"]), (400, "Missing required field: name"))
+            self.assertEqual(server.handle_api("POST", "/api/issuers", "not json")[0], 400)
+            code, html_body, ctype, _ = server.handle_api("GET", "/api/digest.html", today=TODAY)
+            self.assertTrue(ctype.startswith("text/html") and "Weekly CRM digest" in html_body)
+            code, blob, _, hdrs = server.handle_api("GET", "/api/backup", today=TODAY)
+            self.assertTrue(blob.startswith(b"SQLite format 3") and "crm-backup-2026-10-05" in hdrs["Content-Disposition"])
+        finally:
+            server.DB_PATH = old
+
     def test_demo_seed_and_digest(self):
         other = server.connect(os.path.join(self.tmp.name, "demo.db"))
         self.assertTrue(server.seed_demo(other))

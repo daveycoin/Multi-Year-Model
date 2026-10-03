@@ -36,6 +36,18 @@ writes `data/digest.html`. To email it, set `PFCRM_SMTP_HOST`, `PFCRM_SMTP_PORT`
 `PFCRM_SMTP_PASS`, `PFCRM_MAIL_FROM` and `PFCRM_MAIL_TO`, then schedule it (cron, or Windows Task
 Scheduler) for Monday morning. Check with your firm's IT before sending client names through an SMTP relay.
 
+## Shareable web demo (no install for viewers)
+
+`demo-site/` is a static, serverless copy of the app for showing it to others. It runs the same
+`server.py` and front end inside the visitor's browser (Python compiled to WebAssembly via Pyodide),
+loaded with the fictional demo data. Nothing is sent to or stored on any server, and a reload resets it.
+
+- **Publish:** drag the `demo-site` folder onto https://app.netlify.com/drop, or copy its contents into a
+  sub-folder of an existing site (e.g. `crm-demo/`); all paths are relative, so either works.
+- **Rebuild after changing the app:** `python3 build_demo.py` (the Pyodide runtime is downloaded once, then reused).
+- First visit downloads about 6 MB (cached afterwards). Needs a current desktop browser.
+- It is not for real client data. Use the local version for that.
+
 ## Deliberately not in the proof of concept
 
 Multi-user logins and permissions, Outlook sync, outstanding-debt tracking (bond series, call dates,

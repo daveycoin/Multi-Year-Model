@@ -1,0 +1,3 @@
+# Only used if this repo is connected to Netlify: publishes the browser-only CRM demo.
+[build]
+  publish = "pf-crm/demo-site"
