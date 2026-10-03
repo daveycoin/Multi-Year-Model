@@ -32,6 +32,9 @@ STAGES = {
 INACTIVE_STAGES = ("Closed", "Lost", "On Hold")
 DEFAULT_SETTINGS = {"cadence_A": "30", "cadence_B": "90", "cadence_C": "180",
                     "dash_window": "30", "digest_window": "14"}
+GROUPS = ["Elected", "Staff", "Related"]
+ELECTED_WORDS = ("mayor", "council", "commissioner", "alderm", "trustee", "county judge",
+                 "board member", "board president")
 SECTORS = ["City", "County", "K-12 School District", "Higher Education", "Utility",
            "Private School", "Charter School", "Special District", "Other"]
 
@@ -54,6 +57,11 @@ CREATE TABLE IF NOT EXISTS people (
   last_contact TEXT, next_followup TEXT,
   birthday TEXT, anniversary TEXT, spouse TEXT, kids TEXT,
   personal_notes TEXT, notes TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS person_issuers (
+  person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+  issuer_id INTEGER NOT NULL REFERENCES issuers(id) ON DELETE CASCADE,
+  groups TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (person_id, issuer_id));
 CREATE TABLE IF NOT EXISTS projects (
   id INTEGER PRIMARY KEY, name TEXT NOT NULL,
   developer_id INTEGER REFERENCES developers(id) ON DELETE SET NULL,
@@ -124,8 +132,55 @@ def connect(path=None):
     conn.executescript(SCHEMA)
     for k, v in DEFAULT_SETTINGS.items():
         conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v))
+    backfill_links(conn)
     conn.commit()
     return conn
+
+
+def guess_groups(title):
+    t = (title or "").lower()
+    return "Elected" if any(w in t for w in ELECTED_WORDS) else "Staff"
+
+
+def repair_primary(conn):
+    """people.issuer_id is the person's primary issuer: always one of their links (or NULL if none)."""
+    conn.execute("UPDATE people SET issuer_id=(SELECT l.issuer_id FROM person_issuers l WHERE l.person_id=people.id "
+                 "ORDER BY l.rowid LIMIT 1) WHERE issuer_id IS NULL "
+                 "AND EXISTS (SELECT 1 FROM person_issuers l WHERE l.person_id=people.id)")
+
+
+def backfill_links(conn):
+    """Make sure every person with a primary issuer has a link row (also migrates older databases)."""
+    for p in conn.execute("SELECT id, issuer_id, title FROM people WHERE issuer_id IS NOT NULL AND NOT EXISTS "
+                          "(SELECT 1 FROM person_issuers l WHERE l.person_id=people.id AND l.issuer_id=people.issuer_id)").fetchall():
+        conn.execute("INSERT OR IGNORE INTO person_issuers(person_id,issuer_id,groups) VALUES(?,?,?)",
+                     (p["id"], p["issuer_id"], guess_groups(p["title"])))
+    repair_primary(conn)
+
+
+def set_links(conn, pid, links):
+    """Replace a person's issuer links. links = [{issuer_id, groups:[...]}]; the first becomes the primary issuer."""
+    merged = {}
+    for l in links or []:
+        if not l.get("issuer_id"):
+            continue
+        iid = int(l["issuer_id"])
+        merged.setdefault(iid, set()).update(g for g in (l.get("groups") or []) if g in GROUPS)
+    conn.execute("DELETE FROM person_issuers WHERE person_id=?", (pid,))
+    for iid, gs in merged.items():
+        conn.execute("INSERT INTO person_issuers(person_id,issuer_id,groups) VALUES(?,?,?)",
+                     (pid, iid, ",".join(g for g in GROUPS if g in gs)))
+    conn.execute("UPDATE people SET issuer_id=? WHERE id=?", (next(iter(merged), None), pid))
+
+
+def attach_links(conn, rows):
+    m = {}
+    for r in conn.execute("SELECT l.person_id, l.issuer_id, l.groups, i.name FROM person_issuers l "
+                          "JOIN issuers i ON i.id=l.issuer_id ORDER BY l.rowid"):
+        m.setdefault(r["person_id"], []).append({"issuer_id": r["issuer_id"], "issuer_name": r["name"],
+                                                 "groups": [g for g in r["groups"].split(",") if g]})
+    for row in rows:
+        row["links"] = m.get(row["id"], [])
 
 
 def row_dict(r):
@@ -163,16 +218,26 @@ def clean_body(conn, table, body):
 def list_rows(conn, table, filters=None, row_id=None):
     sql, order = QUERIES[table]
     cols = set(table_columns(conn, table))
+    filters = dict(filters or {})
+    linked = filters.pop("linked_issuer", None) if table == "people" else None
     where, args = [], []
     if row_id is not None:
         where.append("t.id=?"); args.append(row_id)
-    for k, v in (filters or {}).items():
+    if linked is not None:
+        where.append("t.id IN (SELECT person_id FROM person_issuers WHERE issuer_id=?)"); args.append(linked)
+    for k, v in filters.items():
         if k in cols:
             where.append(f"t.{k}=?"); args.append(v)
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY " + order
-    return [row_dict(r) for r in conn.execute(sql, args)]
+    rows = [row_dict(r) for r in conn.execute(sql, args)]
+    if table == "people":
+        attach_links(conn, rows)
+        if linked is not None:  # the groups this person belongs to *at this issuer*
+            for r in rows:
+                r["groups"] = next((l["groups"] for l in r["links"] if str(l["issuer_id"]) == str(linked)), [])
+    return rows
 
 
 def after_write(conn, table, row_id, body):
@@ -184,6 +249,7 @@ def after_write(conn, table, row_id, body):
 
 def create_row(conn, table, body):
     extra_followup = body.get("next_followup") if table == "interactions" else None
+    links = body.get("links") if table == "people" else None
     data = clean_body(conn, table, body)
     if table == "deals":
         data.setdefault("pipeline", "standard")
@@ -210,28 +276,29 @@ def create_row(conn, table, body):
         else:  # a logged touch satisfies a follow-up that was due on or before it
             conn.execute("UPDATE people SET next_followup=NULL WHERE id=? AND next_followup<=?", (pid, d))
     after_write(conn, table, rid, data)
+    if table == "people":
+        set_links(conn, rid, links) if links is not None else backfill_links(conn)
     conn.commit()
     return rid
 
 
 def update_row(conn, table, rid, body):
     data = clean_body(conn, table, body)
+    links = body.get("links") if table == "people" else None
+    if not conn.execute(f"SELECT 1 FROM {table} WHERE id=?", (rid,)).fetchone():
+        raise LookupError("not found")
     if table == "deals":
         cur = conn.execute("SELECT pipeline FROM deals WHERE id=?", (rid,)).fetchone()
-        if not cur:
-            raise LookupError("not found")
         pl = data.get("pipeline", cur["pipeline"])
         if pl not in STAGES:
             raise ValueError("unknown pipeline")
         if "stage" in data and data["stage"] not in STAGES[pl]:
             raise ValueError(f"stage '{data['stage']}' is not valid for the {pl} pipeline")
-    if not data:
-        return
-    sets = ",".join(f"{c}=?" for c in data)
-    cur = conn.execute(f"UPDATE {table} SET {sets} WHERE id=?", [*data.values(), rid])
-    if cur.rowcount == 0:
-        raise LookupError("not found")
-    after_write(conn, table, rid, data)
+    if data:
+        conn.execute(f"UPDATE {table} SET {','.join(f'{c}=?' for c in data)} WHERE id=?", [*data.values(), rid])
+        after_write(conn, table, rid, data)
+    if table == "people":
+        set_links(conn, rid, links) if links is not None else backfill_links(conn)
     conn.commit()
 
 
@@ -486,13 +553,16 @@ def import_people(conn, text, dry=False):
             res["duplicates"] += 1
             continue
         pri = g("priority").upper()[:1]
-        conn.execute(
+        cur = conn.execute(
             "INSERT INTO people(name,title,issuer_id,email,phone,priority,birthday,anniversary,spouse,kids,term_end,notes)"
             " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
             (name, g("title") or None, issuer_id, email or None, g("phone") or None,
              pri if pri in ("A", "B", "C") else "C", parse_loose_date(g("birthday")),
              parse_loose_date(g("anniversary")), g("spouse") or None, g("kids") or None,
              parse_loose_date(g("term_end")), g("notes") or None))
+        if issuer_id:
+            conn.execute("INSERT INTO person_issuers(person_id,issuer_id,groups) VALUES(?,?,?)",
+                         (cur.lastrowid, issuer_id, guess_groups(g("title"))))
         res["new_people"] += 1
         if len(res["sample"]) < 5:
             res["sample"].append({"name": name, "title": g("title"), "issuer": iname})
@@ -601,6 +671,18 @@ def seed_demo(conn):
                                 (mayor, -120, "Email", "Sent congratulations on re-election filing.")]:
         iss = conn.execute("SELECT issuer_id FROM people WHERE id=?", (pid,)).fetchone()[0]
         ins("interactions", person_id=pid, issuer_id=iss, date=D(off), type=typ, notes=note)
+    backfill_links(conn)
+    # people tied to several issuers and/or tagged to several groups
+    moreno = conn.execute("SELECT id FROM people WHERE name='Luis Moreno'").fetchone()[0]
+    set_links(conn, moreno, [{"issuer_id": charter, "groups": ["Related"]}])
+    counsel = P(name="Walter Mason", title="Partner, Bond Counsel (Mason & Pratt LLP)", priority="B", last_contact=D(-25))
+    set_links(conn, counsel, [{"issuer_id": i, "groups": ["Related"]} for i in (city, isd, util, mud)])
+    advisor = P(name="Priya Natarajan", title="Municipal Advisor (Public Resources Advisory)", priority="B", last_contact=D(-40))
+    set_links(conn, advisor, [{"issuer_id": i, "groups": ["Related"]} for i in (city, county)])
+    gomez = P(name="Teresa Gomez", title="Council Member", priority="C", term_end=D(300))
+    set_links(conn, gomez, [{"issuer_id": city, "groups": ["Elected"]}, {"issuer_id": county, "groups": ["Related"]}])
+    both = P(name="Harold Finch", title="Finance Committee Chair / City Treasurer", priority="B", last_contact=D(-50))
+    set_links(conn, both, [{"issuer_id": city, "groups": ["Elected", "Staff"]}])
     conn.commit()
     return True
 
@@ -672,7 +754,7 @@ class Handler(BaseHTTPRequestHandler):
         today = dt.date.today()
         head = parts[0] if parts else ""
         if method == "GET" and head == "meta":
-            return self.send(200, {"stages": STAGES, "sectors": SECTORS, "settings": get_settings(conn)})
+            return self.send(200, {"stages": STAGES, "sectors": SECTORS, "groups": GROUPS, "settings": get_settings(conn)})
         if method == "GET" and head == "dashboard":
             return self.send(200, dashboard(conn, today))
         if method == "GET" and head == "events":
@@ -713,6 +795,8 @@ class Handler(BaseHTTPRequestHandler):
             if method == "DELETE" and rid is not None:
                 if not conn.execute(f"DELETE FROM {head} WHERE id=?", (rid,)).rowcount:
                     raise LookupError
+                if head == "issuers":
+                    repair_primary(conn)
                 conn.commit()
                 return self.send(200, {"ok": True})
         self.err(404, "not found")

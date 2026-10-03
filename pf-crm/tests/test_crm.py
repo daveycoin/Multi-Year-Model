@@ -125,6 +125,47 @@ class CRMTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             server.import_people(self.conn, "Company,Email\nX,y@z.com\n")
 
+    def test_person_links_groups_and_primary_issuer(self):
+        other = server.create_row(self.conn, "issuers", {"name": "Maple County", "sector": "County"})
+        pid = server.create_row(self.conn, "people", {
+            "name": "Counsel", "links": [{"issuer_id": self.issuer, "groups": ["Related", "Bogus"]},
+                                         {"issuer_id": other, "groups": ["Related", "Staff"]}]})
+        p = server.list_rows(self.conn, "people", row_id=pid)[0]
+        self.assertEqual(p["issuer_id"], self.issuer)                      # first link is the primary issuer
+        self.assertEqual([(l["issuer_id"], l["groups"]) for l in p["links"]],
+                         [(self.issuer, ["Related"]), (other, ["Staff", "Related"])])  # invalid group dropped, canonical order
+        at_county = server.list_rows(self.conn, "people", {"linked_issuer": other})
+        self.assertEqual([(r["name"], r["groups"]) for r in at_county], [("Counsel", ["Staff", "Related"])])
+        # replacing the links updates primary; removing every link clears it
+        server.update_row(self.conn, "people", pid, {"links": [{"issuer_id": other, "groups": ["Elected"]}]})
+        p = server.list_rows(self.conn, "people", row_id=pid)[0]
+        self.assertEqual((p["issuer_id"], len(p["links"])), (other, 1))
+        server.update_row(self.conn, "people", pid, {"links": []})
+        self.assertIsNone(server.list_rows(self.conn, "people", row_id=pid)[0]["issuer_id"])
+
+    def test_plain_issuer_id_gets_a_guessed_group_link(self):
+        mayor = self.person(name="M", title="Mayor")
+        clerk = self.person(name="C", title="City Clerk")
+        groups = {r["name"]: r["links"][0]["groups"] for r in server.list_rows(self.conn, "people")
+                  if r["id"] in (mayor, clerk)}
+        self.assertEqual(groups, {"M": ["Elected"], "C": ["Staff"]})
+
+    def test_deleting_issuer_moves_primary_to_remaining_link(self):
+        other = server.create_row(self.conn, "issuers", {"name": "Second", "sector": "County"})
+        pid = server.create_row(self.conn, "people", {"name": "Two", "links": [
+            {"issuer_id": self.issuer, "groups": ["Staff"]}, {"issuer_id": other, "groups": ["Related"]}]})
+        self.conn.execute("DELETE FROM issuers WHERE id=?", (self.issuer,))
+        server.repair_primary(self.conn)
+        p = server.list_rows(self.conn, "people", row_id=pid)[0]
+        self.assertEqual((p["issuer_id"], [l["issuer_id"] for l in p["links"]]), (other, [other]))
+
+    def test_old_database_is_migrated(self):
+        self.conn.execute("DELETE FROM person_issuers")        # simulate a pre-groups database
+        pid = self.conn.execute("INSERT INTO people(name,title,issuer_id) VALUES('Old','Council Member',?)",
+                                (self.issuer,)).lastrowid
+        server.backfill_links(self.conn)
+        self.assertEqual(server.list_rows(self.conn, "people", row_id=pid)[0]["links"][0]["groups"], ["Elected"])
+
     def test_demo_seed_and_digest(self):
         other = server.connect(os.path.join(self.tmp.name, "demo.db"))
         self.assertTrue(server.seed_demo(other))

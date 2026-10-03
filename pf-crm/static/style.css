@@ -63,11 +63,9 @@ dialog::backdrop { background: rgba(10,18,30,.5); }
 .dlg-err { color: var(--danger); padding: 0 20px 8px; }
 .kv { display: grid; grid-template-columns: 160px 1fr; gap: 4px 14px; }
 .kv dt { color: var(--muted); } .kv dd { margin: 0; white-space: pre-wrap; }
-.kanban { display: flex; gap: 10px; overflow-x: auto; padding-bottom: 10px; align-items: flex-start; }
-.col { background: var(--chip); border-radius: 8px; min-width: 210px; width: 210px; padding: 8px; }
-.col h4 { margin: 2px 4px 8px; font-size: 12px; display: flex; justify-content: space-between; gap: 6px; }
-.card { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; margin-bottom: 8px; font-size: 13px; }
-.card select { margin-top: 6px; padding: 2px 4px; font-size: 12px; }
+.linkrow { display: flex; gap: 6px 12px; align-items: center; flex-wrap: wrap; margin-bottom: 6px; }
+.linkrow select { flex: 1; min-width: 180px; width: auto; }
+.linkrow label { display: inline-flex; gap: 4px; align-items: center; margin: 0; color: var(--ink); font-size: 13px; }
 .bar { display: grid; grid-template-columns: 1fr auto auto; gap: 4px 14px; font-size: 13px; }
 .bar div:nth-child(3n+2), .bar div:nth-child(3n) { text-align: right; color: var(--muted); }
 .tabs { display: flex; gap: 6px; margin-bottom: 14px; }

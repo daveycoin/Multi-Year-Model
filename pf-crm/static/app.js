@@ -59,7 +59,7 @@ const ENT = {
   people: {
     label: "Person", plural: "People", detail: true, title: r => r.name,
     fields: [F("name", "Name", "text", { req: 1 }), F("title", "Title"),
-      F("issuer_id", "Issuer", "ref", { ref: "issuers" }), F("developer_id", "Developer (if not an issuer contact)", "ref", { ref: "developers" }),
+      F("__links", "Issuers & groups", "links", { full: 1 }), F("developer_id", "Developer (if not an issuer contact)", "ref", { ref: "developers" }),
       F("email", "Email"), F("phone", "Phone"), F("reports_to_id", "Reports to", "ref", { ref: "people" }),
       F("priority", "Priority (sets follow-up cadence)", "select", { options: ["A", "B", "C"] }),
       F("term_start", "Term start", "date"), F("term_end", "Term end", "date"),
@@ -69,7 +69,8 @@ const ENT = {
       F("personal_notes", "Personal notes", "textarea", { full: 1 }), F("notes", "Notes", "textarea", { full: 1 })],
     cols: () => [
       { h: "Name", v: r => link("people", r.id, r.name), s: r => r.name.toLowerCase() }, { h: "Title", v: r => esc(r.title) },
-      { h: "Organization", v: r => r.issuer_id ? link("issuers", r.issuer_id, r.issuer_name) : link("developers", r.developer_id, r.developer_name), s: r => r.issuer_name || r.developer_name || "" },
+      { h: "Organization", v: r => r.links.length ? r.links.map(l => link("issuers", l.issuer_id, l.issuer_name)).join(", ") : link("developers", r.developer_id, r.developer_name), s: r => r.links[0]?.issuer_name || r.developer_name || "" },
+      { h: "Groups", v: r => [...new Set(r.links.flatMap(l => l.groups))].map(g => chip(g)).join(" "), s: r => r.links.flatMap(l => l.groups).join() },
       { h: "Pri", v: r => chip(r.priority), s: r => r.priority || "C" },
       { h: "Last contact", v: r => fdate(r.last_contact), s: r => r.last_contact || "" },
       { h: "Next follow-up", v: r => fdate(r.next_followup), s: r => r.next_followup || "9" },
@@ -135,11 +136,15 @@ const ENT = {
 };
 
 // what each detail page shows below the fields
+const PEOPLE_PICK = ["Name", "Title", "Pri", "Last contact", "Next follow-up", "Term ends"];
 const RELATED = {
   issuers: [
-    { title: "People", entity: "people", key: "issuer_id", pick: ["Name", "Title", "Pri", "Last contact", "Next follow-up", "Term ends"] },
+    { title: "Elected", group: "Elected", entity: "people", pick: PEOPLE_PICK },
+    { title: "Staff", group: "Staff", entity: "people", pick: PEOPLE_PICK },
+    { title: "Related (advisors, counsel, trustees, etc.)", group: "Related", entity: "people", pick: PEOPLE_PICK },
+    { title: "Ungrouped (assign a group by editing the person)", group: "Ungrouped", entity: "people", pick: PEOPLE_PICK, hideIfEmpty: 1, noAdd: 1 },
     { title: "Financings", entity: "deals", key: "issuer_id", pick: ["Financing", "Stage", "Par", "Expected", "RFP due"] },
-    { title: "Developer projects behind this issuer", entity: "projects", key: "issuer_id", pick: ["Project", "Developer", "Structure", "Est. par"], noAdd: 1 },
+    { title: "Developer projects behind this issuer", entity: "projects", key: "issuer_id", pick: ["Project", "Developer", "Structure", "Est. par"], noAdd: 1, hideIfEmpty: 1 },
     { title: "Key dates", entity: "key_dates", key: "issuer_id", pick: ["Date", "Title", "Type", ""] },
     { title: "Recent interactions", entity: "interactions", key: "issuer_id", pick: ["Date", "Type", "Person", "Notes"], noAdd: 1 },
   ],
@@ -189,7 +194,7 @@ pages.dashboard = async main => {
   const pipe = (key, label) => {
     const p = d.pipeline[key];
     const rows = p.stages.filter(s => s.count).map(s => `<div>${esc(s.stage)}</div><div>${s.count}</div><div>${money(s.par) || "–"}</div>`).join("");
-    return `<div class="panel"><div class="head"><h2>${label}</h2><a href="#/deals/${key}">Open board →</a></div>
+    return `<div class="panel"><div class="head"><h2>${label}</h2><a href="#/deals/${key}">Open pipeline →</a></div>
       ${rows ? `<div class="bar">${rows}</div>` : `<div class="empty">No financings yet.</div>`}
       <div class="muted" style="margin-top:8px">Active par ${money(p.active_par) || "$0"} · probability-weighted ${money(p.weighted_par) || "$0"}</div></div>`;
   };
@@ -234,16 +239,23 @@ async function detailPage(main, entity, id) {
     return `<dt>${esc(f.label)}</dt><dd>${v}</dd>`;
   });
   if (entity === "issuers" && r.extra) for (const [k, label, type] of SECTOR_FIELDS[r.sector] || []) if (r.extra[k] != null && r.extra[k] !== "") rows.push(`<dt>${esc(label)}</dt><dd>${esc(type === "number" ? num(r.extra[k]) : r.extra[k])}</dd>`);
+  if (entity === "people" && r.links.length) rows.unshift(`<dt>Issuers</dt><dd>${r.links.map(l => `${link("issuers", l.issuer_id, l.issuer_name)} ${l.groups.map(g => chip(g)).join(" ")}`).join("<br>")}</dd>`);
   const sub = { issuers: () => `${chip(r.sector)} ${esc(r.state)}`, people: () => esc([r.title, r.issuer_name || r.developer_name].filter(Boolean).join(", ")), developers: () => "", projects: () => esc(r.developer_name || "") }[entity]();
   main.innerHTML = `<div class="head"><div><h1>${esc(E.title(r))}</h1><div class="sub">${sub}</div></div>
     <div><button class="btn" data-edit="${entity}:${id}">Edit</button> <button class="btn danger" data-del="${entity}:${id}">Delete</button></div></div>
     <div class="panel"><dl class="kv">${rows.join("") || '<span class="muted">No details yet.</span>'}</dl></div>
     <div id="related"></div>`;
+  let atIssuer = null;
   for (const sec of RELATED[entity]) {
     const E2 = ENT[sec.entity];
-    const data = (await api("GET", `/${sec.entity}?${sec.key}=${id}`));
+    let data;
+    if (sec.group) {  // people at this issuer, split by group; a person tagged to several groups appears in each
+      atIssuer ??= await api("GET", `/people?linked_issuer=${id}`);
+      data = atIssuer.filter(p => sec.group === "Ungrouped" ? !p.groups.length : p.groups.includes(sec.group));
+    } else data = await api("GET", `/${sec.entity}?${sec.key}=${id}`);
+    if (sec.hideIfEmpty && !data.length) continue;
     const cols = E2.cols().filter(c => sec.pick.includes(c.h));
-    const prefill = { [sec.key]: +id, ...(sec.prefill || {}) };
+    const prefill = sec.group ? { links: [{ issuer_id: +id, groups: [sec.group] }] } : { [sec.key]: +id, ...(sec.prefill || {}) };
     if (entity === "projects" && r.issuer_id) prefill.issuer_id = r.issuer_id;
     if (entity === "people" && sec.entity === "interactions") prefill.person_id = +id;
     const div = document.createElement("div"); div.className = "panel";
@@ -252,23 +264,42 @@ async function detailPage(main, entity, id) {
   }
 }
 
+const INACTIVE = ["Closed", "Lost", "On Hold"];
 pages.deals = async (main, which) => {
-  const pl = which === "developer" ? "developer" : "standard";
-  const deals = (await api("GET", "/deals")).filter(d => d.pipeline === pl);
-  const cols = META.stages[pl].map(stage => {
-    const ds = deals.filter(d => d.stage === stage), par = ds.reduce((a, d) => a + (d.par || 0), 0);
-    const cards = ds.map(d => `<div class="card"><div>${editLink("deals", d.id, d.name)}</div>
-      <div class="muted">${esc(d.project_name ? d.project_name + " · " : "")}${esc(d.issuer_name)}</div>
-      <div>${money(d.par)} ${d.probability ? `<span class="muted">· ${d.probability}%</span>` : ""}</div>
-      ${d.expected_date ? `<div class="muted">Pricing ${fdate(d.expected_date)}</div>` : ""}
-      ${d.rfp_deadline ? `<div>${chip("RFP " + fdate(d.rfp_deadline), "warn")}</div>` : ""}
-      <select data-move="${d.id}">${META.stages[pl].map(s => `<option ${s === d.stage ? "selected" : ""}>${esc(s)}</option>`).join("")}</select></div>`).join("");
-    return `<div class="col"><h4><span>${esc(stage)}</span><span class="muted">${ds.length}${par ? " · " + money(par) : ""}</span></h4>${cards}</div>`;
-  }).join("");
-  main.innerHTML = `<div class="head"><div><h1>Pipeline</h1><div class="sub">${deals.length} financings</div></div>
+  const pl = which === "developer" ? "developer" : "standard", stages = META.stages[pl];
+  const all = (await api("GET", "/deals")).filter(d => d.pipeline === pl);
+  const cols = [
+    { h: "Financing", v: r => editLink("deals", r.id, r.name), s: r => r.name.toLowerCase() },
+    { h: "Stage", v: r => `<select data-move="${r.id}" style="width:auto">${stages.map(s => `<option ${s === r.stage ? "selected" : ""}>${esc(s)}</option>`).join("")}</select>`, s: r => stages.indexOf(r.stage) },
+    { h: pl === "developer" ? "Project / issuer" : "Issuer", v: r => esc([r.project_name, r.issuer_name].filter(Boolean).join(" / ")), s: r => r.issuer_name || "" },
+    { h: "Par", v: r => money(r.par), s: r => r.par || 0 },
+    { h: "Prob.", v: r => r.probability ? r.probability + "%" : "", s: r => r.probability || 0 },
+    { h: "Expected", v: r => fdate(r.expected_date), s: r => r.expected_date || "9" },
+    { h: "RFP due", v: r => r.rfp_deadline ? chip(fdate(r.rfp_deadline), "warn") : "", s: r => r.rfp_deadline || "9" },
+    { h: "MA", v: r => esc(r.ma_name), s: r => r.ma_name || "" },
+    { h: "Bond counsel", v: r => esc(r.bond_counsel), s: r => r.bond_counsel || "" }];
+  const saved = sessionStorage.getItem("dealfilter") || "active";
+  main.innerHTML = `<div class="head"><div><h1>Pipeline</h1><div class="sub" id="count"></div></div>
     <button class="btn primary" data-add="deals" data-prefill='${JSON.stringify({ pipeline: pl })}'>+ Add financing</button></div>
     <div class="tabs"><a class="btn ${pl === "standard" ? "active" : ""}" href="#/deals/standard">Issuer financings</a>
-    <a class="btn ${pl === "developer" ? "active" : ""}" href="#/deals/developer">Developer deals</a></div><div class="kanban">${cols}</div>`;
+    <a class="btn ${pl === "developer" ? "active" : ""}" href="#/deals/developer">Developer deals</a></div>
+    <div class="toolbar"><input id="q" type="search" placeholder="Search..."><select id="f-stage">
+      <option value="active">Active (hide closed / lost / on hold)</option><option value="all">All stages</option>
+      ${stages.map(s => `<option ${s === saved ? "selected" : ""}>${esc(s)}</option>`).join("")}</select></div>
+    <div class="panel" id="tbl"></div>`;
+  $("#f-stage").value = [...$("#f-stage").options].some(o => o.value === saved) ? saved : "active";
+  const draw = () => {
+    const f = $("#f-stage").value, q = $("#q").value.toLowerCase();
+    const rows = all.filter(d => (f === "active" ? !INACTIVE.includes(d.stage) : f === "all" || d.stage === f) && (!q || JSON.stringify(Object.values(d)).toLowerCase().includes(q)))
+      .sort((a, b) => stages.indexOf(a.stage) - stages.indexOf(b.stage) || (a.expected_date || "9").localeCompare(b.expected_date || "9"));
+    const par = rows.reduce((t, d) => t + (d.par || 0), 0), w = rows.reduce((t, d) => t + (d.par || 0) * (d.probability || 0) / 100, 0);
+    $("#count").textContent = `${rows.length} financings · ${money(par) || "$0"} par · ${money(w) || "$0"} probability-weighted`;
+    $("#tbl").innerHTML = table(cols, rows, "No financings match.");
+    sortable($("#tbl"), cols, rows);
+  };
+  $("#q").addEventListener("input", draw);
+  $("#f-stage").addEventListener("change", () => { sessionStorage.setItem("dealfilter", $("#f-stage").value); draw(); });
+  draw();
 };
 
 pages.dates = async main => {
@@ -331,8 +362,14 @@ async function openForm(entity, rec = {}, prefill = {}) {
   if (entity === "issuers" && !data.sector) data.sector = "City";
   const refs = {};
   await Promise.all(E.fields.filter(f => f.type === "ref").map(async f => refs[f.ref] ??= await api("GET", "/" + f.ref)));
+  if (entity === "people") refs.issuers ??= await api("GET", "/issuers");
   const opt = (v, label, sel) => `<option value="${esc(v)}" ${String(sel) === String(v) ? "selected" : ""}>${esc(label)}</option>`;
+  const linkRow = l => `<div class="linkrow"><select class="lk-issuer"><option value="">— issuer —</option>${refs.issuers.map(o => opt(o.id, o.name, l.issuer_id)).join("")}</select>
+    ${META.groups.map(g => `<label><input type="checkbox" value="${g}" ${(l.groups || []).includes(g) ? "checked" : ""}> ${g}</label>`).join("")}
+    <button type="button" class="btn sm lk-del" title="Remove this issuer">✕</button></div>`;
   const input = f => {
+    if (f.type === "links") return `<div class="full"><label>${esc(f.label)} (tag each issuer with one or more groups; the first is the primary issuer)</label>
+      <div id="links">${(data.links?.length ? data.links : [{}]).map(linkRow).join("")}</div><button type="button" class="btn sm" id="addlink">+ Link another issuer</button></div>`;
     const v = data[f.k] ?? "", id = `f_${f.k}`;
     let ctl;
     if (f.type === "textarea") ctl = `<textarea id="${id}" name="${f.k}" rows="3">${esc(v)}</textarea>`;
@@ -352,6 +389,10 @@ async function openForm(entity, rec = {}, prefill = {}) {
     <div class="dlg-foot"><div>${editing ? `<button type="button" class="btn danger" id="fdel">Delete</button>` : ""}</div>
     <div><button type="button" class="btn" id="fcancel">Cancel</button> <button class="btn primary" id="fsave">Save</button></div></div></form>`;
   const form = $("#ff");
+  if (entity === "people") {
+    $("#addlink").addEventListener("click", () => $("#links").insertAdjacentHTML("beforeend", linkRow({})));
+    $("#links").addEventListener("click", e => { if (e.target.classList.contains("lk-del")) e.target.closest(".linkrow").remove(); });
+  }
   if (entity === "issuers") form.elements.sector.addEventListener("change", e => { data.sector = e.target.value; data.extra = {}; $("#extra").innerHTML = extraHTML(data.sector); });
   if (entity === "deals") form.elements.pipeline.addEventListener("change", e => {
     const st = form.elements.stage; st.innerHTML = META.stages[e.target.value].map(s => opt(s, s, "")).join("");
@@ -369,6 +410,9 @@ async function openForm(entity, rec = {}, prefill = {}) {
       const el = form.elements[f.k]; if (!el) continue;
       body[f.k] = f.type === "bool" ? (el.checked ? 1 : 0) : el.value === "" ? null : (f.type === "number" || f.type === "ref" || f.k === "probability") ? +el.value : el.value;
     }
+    if (entity === "people") body.links = [...form.querySelectorAll(".linkrow")].map(row => ({
+      issuer_id: +row.querySelector(".lk-issuer").value || null,
+      groups: [...row.querySelectorAll("input:checked")].map(i => i.value) })).filter(l => l.issuer_id);
     if (entity === "issuers") body.extra = Object.fromEntries((SECTOR_FIELDS[body.sector] || []).map(([k, , t]) => { const v = form.elements["x_" + k].value; return [k, v === "" ? null : t === "number" ? +v : v]; }));
     try {
       if (editing) await api("PUT", `/${entity}/${rec.id}`, body); else await api("POST", "/" + entity, body);
