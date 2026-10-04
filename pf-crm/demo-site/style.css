@@ -12,7 +12,8 @@
 }
 * { box-sizing: border-box; }
 body { margin: 0; font: 14px/1.45 "Segoe UI", system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--ink); display: flex; min-height: 100vh; }
-#nav { width: 190px; background: #14293f; color: #fff; padding: 18px 0; flex-shrink: 0; position: sticky; top: 0; height: 100vh; }
+#nav { width: 190px; background: #14293f; color: #fff; padding: 18px 0; flex-shrink: 0; position: sticky; top: 0; align-self: flex-start;
+  height: 100vh; height: 100dvh; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: rgba(255,255,255,.28) transparent; }
 .brand { font-weight: 700; font-size: 15px; padding: 0 18px 16px; line-height: 1.2; }
 .brand span { display: block; font-weight: 400; opacity: .65; font-size: 12px; letter-spacing: .08em; text-transform: uppercase; }
 #nav a { display: block; padding: 9px 18px; color: #cfd9e6; text-decoration: none; border-left: 3px solid transparent; }
