@@ -127,7 +127,7 @@ for l in lines:
     l["manual"] = MAN.get(k)
 
 METHODS = ["Flat", "Inflation", "Salary", "Benefits", "Per Student", "Enrollment", "Tuition Index",
-           "% of Salaries", "Debt", "Reserve Yield", "Manual"]
+           "% of Salaries", "Debt", "Reserve Yield", "Trend", "Manual"]
 PROFILES = ["Tuition Plan", "Even", "Jul Lump", "Custom A", "Custom B"]
 
 wb = openpyxl.Workbook()
@@ -136,9 +136,11 @@ wsS.title = "Summary"
 wsI = wb.create_sheet("Inputs")
 wsE = wb.create_sheet("Enrollment")
 wsF = wb.create_sheet("Forecast Detail")
+wsT = wb.create_sheet("Trend")
 wsC = wb.create_sheet("Cash Flow")
 wsCS = wb.create_sheet("CF Summary")
 wsQ = wb.create_sheet("QB Import")
+wsA = wb.create_sheet("Actuals Import")
 wsR = wb.create_sheet("Read Me")
 for ws in wb:
     ws.sheet_view.showGridLines = False
@@ -148,6 +150,7 @@ SC = ["B", "C", "D", "E", "F"]          # Summary / Enrollment / CF Summary year
 
 # ================================================================= QB IMPORT
 QN = 600
+TR1 = 47   # first detail row on Trend (mirrors Forecast Detail row 8)
 for r in range(1, src.max_row + 1):
     for c in (1, 2, 3):
         v = src.cell(r, c).value
@@ -393,6 +396,25 @@ R_PRCHK = PR1 + 5
 put(ws, f"A{R_PRCHK}", "Profile rows must total 100%", f_sub)
 ws.conditional_formatting.add(f"P{PR1}:P{PR1+4}", FormulaRule(formula=[f"ABS(P{PR1}-1)>0.0001"], fill=PatternFill("solid", bgColor="FFC7CE")))
 ws.conditional_formatting.add(f"P{SCH1}:P{SCH1+2}", FormulaRule(formula=[f"ABS(P{SCH1}-1)>0.0001"], fill=PatternFill("solid", bgColor="FFC7CE")))
+
+# --- trend analysis settings
+R_TR = R_PRCHK + 2
+section(ws, R_TR, "Prior-year actuals & trend recommendation (see Actuals Import and Trend tabs)", 7)
+put(ws, f"A{R_TR+1}", "Actuals slot (paste export on Actuals Import)", f_bold)
+put(ws, f"C{R_TR+1}", "FY ending (e.g. 2026)", f_bold)
+AY1 = R_TR + 2
+slot_cols = ["A", "J", "S", "AB", "AK"]
+for k in range(5):
+    put(ws, f"A{AY1+k}", f"Slot {k+1} ({'oldest' if k == 0 else 'newest' if k == 4 else 'next'}): paste at {slot_cols[k]}1 on Actuals Import")
+    inp(ws, f"C{AY1+k}", None, "0")
+put(ws, f"H{AY1}", "Enter the fiscal year (ending June 30) of each pasted export, oldest to newest. Blank = slot unused.", f_sub)
+R_TRM, R_TRR, R_TRT = AY1 + 5, AY1 + 6, AY1 + 7
+put(ws, f"A{R_TRM}", "Default recommendation method"); inp(ws, f"C{R_TRM}", "Linear Trend")
+put(ws, f"H{R_TRM}", "Last Actual / Average / Linear Trend / Growth (override per line on Trend tab)", f_sub)
+put(ws, f"A{R_TRR}", "Round recommendation to nearest $"); inp(ws, f"C{R_TRR}", 100, NUM)
+put(ws, f"A{R_TRT}", "Flag lines that differ from FY27 budget by more than"); inp(ws, f"C{R_TRT}", 0.10, PCT)
+dvt = DataValidation(type="list", formula1='"Last Actual,Average,Linear Trend,Growth"', allow_blank=True)
+ws.add_data_validation(dvt); dvt.add(f"C{R_TRM}")
 ws.freeze_panes = "B7"
 
 # ================================================================= ENROLLMENT
@@ -492,6 +514,13 @@ for i, c in enumerate(FY):
         put(ws, f"{c}6", f'=SUMIF($E${D1}:$E${DL},"Salary",{c}${D1}:{c}${DL})', fmt=NUM)
     else:  # all 'Salary' lines grow at the same %, so no need to re-sum the column (avoids a circular reference)
         put(ws, f"{c}6", f"={FY[i-1]}6*(1+Inputs!{YC[i]}${R_SAL})", fmt=NUM)
+
+def trend_expr(r, i, P, IC):
+    """FY28 = Trend tab recommendation (falls back to flat); later years = prior x (1 + inflation)."""
+    if i == 1:
+        return f'IF($E{r}="Trend",IF(ISNUMBER(Trend!$Q{TR1 + r - D1}),Trend!$Q{TR1 + r - D1},{P}{r}),{P}{r})'
+    return f'IF($E{r}="Trend",{P}{r}*(1+Inputs!{IC}${R_INFL}),{P}{r})'
+
 for n, l in enumerate(lines):
     r = D1 + n
     put(ws, f"A{r}", l["type"]); put(ws, f"B{r}", l["cat"])
@@ -505,7 +534,8 @@ for n, l in enumerate(lines):
              f'IF($E{r}="Salary",{P}{r}*(1+Inputs!{IC}${R_SAL}),IF($E{r}="Benefits",{P}{r}*(1+Inputs!{IC}${R_BEN}),'
              f'IF($E{r}="Per Student",{P}{r}*{X}$4/{P}$4*(1+Inputs!{IC}${R_INFL}),IF($E{r}="Enrollment",{P}{r}*{X}$4/{P}$4,'
              f'IF($E{r}="Tuition Index",{P}{r}*{X}$5/{P}$5,IF($E{r}="% of Salaries",IF($G$6=0,0,$G{r}/$G$6*{X}$6),'
-             f'IF($E{r}="Debt",$G{r}*Inputs!{IC}${R_DEBTMO}/12,IF($E{r}="Reserve Yield",Inputs!{IC}${R_YLD}*Inputs!{IC}${R_INTBASE},{P}{r})))))))))))')
+             f'IF($E{r}="Debt",$G{r}*Inputs!{IC}${R_DEBTMO}/12,IF($E{r}="Reserve Yield",Inputs!{IC}${R_YLD}*Inputs!{IC}${R_INTBASE},'
+             + trend_expr(r, i, P, IC) + ')))))))))))')
         put(ws, f"{X}{r}", f, fmt=NUM)
         mv = l["manual"][i - 1] if l["manual"] else None
         inp(ws, f"{M}{r}", mv, NUM)
@@ -773,7 +803,151 @@ ws.sheet_properties.pageSetUpPr = openpyxl.worksheet.properties.PageSetupPropert
 ws.print_options.horizontalCentered = True
 ws.freeze_panes = "B6"
 
-for w, ori in ((wsCS, "landscape"), (wsC, "landscape"), (wsF, "landscape"), (wsI, "landscape"), (wsE, "portrait")):
+# ================================================================= ACTUALS IMPORT (5 slots)
+ws = wsA
+ABASE = [1 + 9 * k for k in range(5)]
+slot = []
+for k in range(5):
+    cA, cB, cC, cD, cE, cF, cG, cH, cSp = [L(ABASE[k] + o) for o in range(9)]
+    slot.append(dict(B=cB, E=cE, F=cF, G=cG, H=cH))
+    for r in range(1, QN + 1):
+        pE = f"{cE}{r-1}" if r > 1 else '""'
+        pF = f"{cF}{r-1}" if r > 1 else '""'
+        put(ws, f"{cD}{r}", f"=TRIM({cA}{r})", f_link)
+        put(ws, f"{cE}{r}", f'=IF({cD}{r}="Revenue","Revenue",IF({cD}{r}="Cost of Goods Sold","COGS",IF({cD}{r}="Expenditures","Expense",'
+            f'IF({cD}{r}="Other Revenue","Other Revenue",IF({cD}{r}="Other Expenditures","Other Expense",{pE})))))', f_link)
+        put(ws, f"{cF}{r}", f'=IF(OR({cD}{r}="Revenue",{cD}{r}="Cost of Goods Sold",{cD}{r}="Expenditures",{cD}{r}="Other Revenue",{cD}{r}="Other Expenditures"),{cE}{r},'
+            f'IF(AND(LEN({cD}{r})>2,MID({cD}{r},2,1)=" ",ISNUMBER(VALUE(LEFT({cD}{r},1)))),{cD}{r},{pF}))', f_link)
+        put(ws, f"{cG}{r}", f'=IF(AND({cD}{r}<>"",ISNUMBER({cB}{r}),LEFT({cD}{r},9)<>"Total for",{cD}{r}<>"Gross Profit",{cD}{r}<>"Net Operating Revenue",'
+            f'{cD}{r}<>"Net Other Revenue",{cD}{r}<>"Net Revenue"),1,0)', f_link)
+        put(ws, f"{cH}{r}", f'=IF({cG}{r}=1,IF(AND(LEN({cD}{r})>7,ISNUMBER(VALUE(LEFT({cD}{r},6))),MID({cD}{r},7,1)=" "),LEFT({cD}{r},6),{cD}{r}),"")', f_link)
+    for c, w in zip((cA, cB, cC, cD, cE, cF, cG, cH, cSp), (40, 14, 12, 4, 12, 26, 8, 30, 3)):
+        ws.column_dimensions[c].width = w
+ic = L(ABASE[4] + 10)
+put(ws, f"{ic}1", "HOW TO LOAD PRIOR-YEAR ACTUALS", f_bold)
+for i, t in enumerate(["Each block of columns holds one prior-year QuickBooks P&L export (same layout as the budget export).",
+                       "Slot 1 = paste at A1, slot 2 = J1, slot 3 = S1, slot 4 = AB1, slot 5 = AK1 (oldest to newest).",
+                       "Set the fiscal year of each slot on the Inputs tab (leave blank to skip a slot).",
+                       "Only paste into the first three columns of each block; the green columns beside them are helper formulas.",
+                       "Account numbers / major-category headers must match the budget export for lines to line up on the Trend tab."], start=2):
+    put(ws, f"{ic}{i}", t)
+ws.column_dimensions[ic].width = 90
+
+# ================================================================= TREND
+ws = wsT
+put(ws, "A1", "PRIOR-YEAR TRENDS & RECOMMENDED BUDGET", f_title)
+put(ws, "A2", "Load up to 5 years of actuals on Actuals Import. Four trend methods are computed for every account; the selected one becomes the recommendation.", f_sub)
+ws.column_dimensions["A"].width = 44
+for c in range(2, 21):
+    ws.column_dimensions[L(c)].width = 13
+ws.column_dimensions["D"].width = 18
+put(ws, "A3", "Years of actuals loaded", f_bold); put(ws, "B3", "=COUNT(B4:F4)", f_bold, "0")
+put(ws, "C3", "First year", f_bold); put(ws, "D3", '=IF(B3=0,"",MIN(B4:F4))', f_bold, "0", al=Alignment(horizontal="left"))
+put(ws, "E3", "Latest year", f_bold); put(ws, "F3", '=IF(B3=0,"",MAX(B4:F4))', f_bold, "0")
+put(ws, "G3", "Target year", f_bold); put(ws, "H3", f"=YEAR(Inputs!$D${R_END})", f_bold, "0")
+put(ws, "A4", "Fiscal year ending (from Inputs)")
+for k, c in enumerate(SC):
+    put(ws, f"{c}4", f'=IF(ISNUMBER(Inputs!$C${AY1+k}),Inputs!$C${AY1+k},"")', fmt="0")
+# --- category table
+hdrs = ["Major category"] + [f'=IF(ISNUMBER({c}$4),"FY"&RIGHT({c}$4,2)&" Actual","(unused)")' for c in SC] + \
+       [f'=Inputs!{YC[0]}${R_LBL}&" Budget"'] + [f'=Inputs!{c}${R_LBL}&" Fcst"' for c in YC[1:]] + ["Avg annual growth (actuals)", "FY27 budget vs last actual"]
+for i, t in enumerate(hdrs):
+    put(ws, f"{L(i+1)}5", t)
+hdr_row(ws, 5, 1, 13)
+ws.row_dimensions[5].height = 30
+cat_rows = [(6 + i, c, 11 + i) for i, c in enumerate(rev_cats)] + [(11 + i, c, 18 + i) for i, c in enumerate(exp_cats)]
+FC = ["G", "H", "I", "J", "K"]    # budget + forecast columns on Trend category table
+def slot_sum(k, r):
+    s_ = slot[k]
+    q = lambda col: f"'Actuals Import'!${s_[col]}$1:${s_[col]}${QN}"
+    return f"SUMIFS({q('B')},{q('F')},$A{r},{q('G')},1)"
+for r, cat, srow in cat_rows:
+    put(ws, f"A{r}", cat)
+    for k, c in enumerate(SC):
+        put(ws, f"{c}{r}", f'=IF(ISNUMBER({c}$4),{slot_sum(k, r)},"")', fmt=NUM)
+    for j, c in enumerate(FC):
+        put(ws, f"{c}{r}", f"=Summary!{SC[j]}{srow}", f_link, NUM)
+R_TREV, R_TSTR, R_TEXP, R_TNET = 10, 16, 17, 18
+put(ws, f"A{R_TREV}", "Total Revenue", f_bold); put(ws, f"A{R_TSTR}", "Strategic Plan Initiatives")
+put(ws, f"A{R_TEXP}", "Total Expenses", f_bold); put(ws, f"A{R_TNET}", "Net Operating Revenue", f_bold)
+for k, c in enumerate(SC):
+    put(ws, f"{c}{R_TREV}", f'=IF(ISNUMBER({c}$4),SUM({c}6:{c}9),"")', f_bold, NUM, fill_tot, border=top)
+    put(ws, f"{c}{R_TEXP}", f'=IF(ISNUMBER({c}$4),SUM({c}11:{c}15),"")', f_bold, NUM, fill_tot, border=top)
+    put(ws, f"{c}{R_TNET}", f'=IF(ISNUMBER({c}$4),{c}{R_TREV}-{c}{R_TEXP},"")', f_bold, NUM, fill_tot, border=topbot)
+for j, c in enumerate(FC):
+    put(ws, f"{c}{R_TSTR}", f"=Summary!{SC[j]}{R_STRAT}", f_link, NUM)
+    put(ws, f"{c}{R_TREV}", f"=Summary!{SC[j]}{R_REV}", f_bold, NUM, fill_tot, border=top)
+    put(ws, f"{c}{R_TEXP}", f"=Summary!{SC[j]}{R_EXP}", f_bold, NUM, fill_tot, border=top)
+    put(ws, f"{c}{R_TNET}", f"=Summary!{SC[j]}{R_NOP}", f_bold, NUM, fill_tot, border=topbot)
+for r in list(range(6, 16)) + [R_TREV, R_TEXP]:
+    if True:
+        first = f"INDEX($B{r}:$F{r},MATCH($D$3,$B$4:$F$4,0))"
+        last = f"INDEX($B{r}:$F{r},MATCH($F$3,$B$4:$F$4,0))"
+        put(ws, f"L{r}", f'=IF(OR($B$3<2,$F$3=$D$3),"",IFERROR(IF({first}*{last}>0,({last}/{first})^(1/($F$3-$D$3))-1,""),""))', fmt=PCT)
+        put(ws, f"M{r}", f'=IF($B$3=0,"",IF({last}=0,"",$G{r}/{last}-1))', fmt=PCT)
+put(ws, "A19", "Forecast columns come from the Summary tab; forecast totals include Strategic Plan Initiatives.", f_sub)
+# --- chart data (helper) + chart
+put(ws, "A41", "Chart data (do not edit)", Font(name=FONT, size=8, color="808080"))
+for i, c in enumerate(["B", "C", "D", "E", "F", "G", "H", "I", "J", "K"]):
+    put(ws, f"{c}41", f"={c}5", Font(name=FONT, size=8, color="808080"))
+    for rr, src_r in ((42, R_TREV), (43, R_TEXP)):
+        put(ws, f"{c}{rr}", f"=IF(ISNUMBER({c}{src_r}),{c}{src_r},NA())", Font(name=FONT, size=8, color="808080"), NUM)
+put(ws, "A42", "Total Revenue", Font(name=FONT, size=8, color="808080")); put(ws, "A43", "Total Expenses", Font(name=FONT, size=8, color="808080"))
+ws.conditional_formatting.add("B42:K43", FormulaRule(formula=["ISNA(B42)"], font=Font(name=FONT, size=8, color="FFFFFF")))
+from openpyxl.chart import LineChart, Reference
+ch = LineChart()
+ch.title = "Revenue vs expenses: actuals, FY27 budget and forecast"
+ch.height, ch.width = 8.5, 26
+ch.add_data(Reference(ws, min_col=1, max_col=11, min_row=42, max_row=43), from_rows=True, titles_from_data=True)
+ch.set_categories(Reference(ws, min_col=2, max_col=11, min_row=41, max_row=41))
+ch.y_axis.numFmt = '#,##0'
+ch.y_axis.delete = False
+ch.x_axis.delete = False
+ch.legend.position = "b"
+ws.add_chart(ch, "A21")
+# --- detail table
+TR_Y = TR1 - 2
+put(ws, f"A{TR_Y}", "Account-level trend and recommendation", f_bold)
+dh = ["Description", "Type", "Key", "Major category"] + [f"={c}$5" for c in SC] + \
+     [f'=Inputs!{YC[0]}${R_LBL}&" Budget"', "Last actual", "Average", "Linear trend", "Growth-based", "Override method",
+      "Method used", f'="Recommended "&Inputs!{YC[1]}${R_LBL}', f'="Model "&Inputs!{YC[1]}${R_LBL}', "Rec vs FY27 budget", "Flag"]
+for i, t in enumerate(dh):
+    put(ws, f"{L(i+1)}{TR1-1}", t)
+hdr_row(ws, TR1 - 1, 1, 20)
+ws.row_dimensions[TR1 - 1].height = 30
+ECOLS = ["E", "F", "G", "H", "I"]
+rnd, thr, defm = f"Inputs!$C${R_TRR}", f"Inputs!$C${R_TRT}", f"Inputs!$C${R_TRM}"
+for n, l in enumerate(lines):
+    t, r = TR1 + n, D1 + n
+    for col, src_c in (("A", "D"), ("B", "A"), ("C", "C"), ("D", "B")):
+        put(ws, f"{col}{t}", f"='Forecast Detail'!{src_c}{r}", f_link)
+    for k, c in enumerate(ECOLS):
+        s_ = slot[k]
+        q = lambda col: f"'Actuals Import'!${s_[col]}$1:${s_[col]}${QN}"
+        put(ws, f"{c}{t}", f'=IF(ISNUMBER({SC[k]}$4),SUMIFS({q("B")},{q("H")},$C{t},{q("G")},1),"")', fmt=NUM)
+    put(ws, f"J{t}", f"='Forecast Detail'!G{r}", f_link, NUM)
+    rng = f"$E{t}:$I{t}"
+    firstv = f"INDEX({rng},MATCH($D$3,$B$4:$F$4,0))"
+    put(ws, f"K{t}", f'=IF($B$3=0,"",INDEX({rng},MATCH($F$3,$B$4:$F$4,0)))', fmt=NUM)
+    put(ws, f"L{t}", f'=IF($B$3=0,"",AVERAGE({rng}))', fmt=NUM)
+    put(ws, f"M{t}", f'=IF($B$3<3,"",IFERROR(FORECAST($H$3,{rng},$B$4:$F$4),""))', fmt=NUM)
+    put(ws, f"N{t}", f'=IF($B$3<2,"",IFERROR(IF({firstv}*K{t}>0,K{t}*(K{t}/{firstv})^(($H$3-$F$3)/($F$3-$D$3)),K{t}),K{t}))', fmt=NUM)
+    inp(ws, f"O{t}", None)
+    put(ws, f"P{t}", f'=IF(O{t}<>"",O{t},{defm})')
+    x = f'IF(P{t}="Last Actual",K{t},IF(P{t}="Average",L{t},IF(P{t}="Linear Trend",M{t},N{t})))'
+    x2 = f"IF(ISNUMBER({x}),{x},K{t})"
+    put(ws, f"Q{t}", f'=IF($B$3=0,"",IF({rnd}>0,ROUND({x2}/{rnd},0)*{rnd},{x2}))', f_bold, NUM)
+    put(ws, f"R{t}", f"='Forecast Detail'!H{r}", f_link, NUM)
+    put(ws, f"S{t}", f'=IF(Q{t}="","",IF(J{t}=0,"",Q{t}/J{t}-1))', fmt=PCT)
+    put(ws, f"T{t}", f'=IF(S{t}="","",IF(ABS(S{t})>{thr},"REVIEW",""))', Font(name=FONT, size=10, bold=True, color="C00000"))
+TN = TR1 + len(lines) - 1
+dvo = DataValidation(type="list", formula1='"Last Actual,Average,Linear Trend,Growth"', allow_blank=True)
+ws.add_data_validation(dvo); dvo.add(f"O{TR1}:O{TN}")
+ws.auto_filter.ref = f"A{TR1-1}:T{TN}"
+ws.freeze_panes = "E6"
+ws.page_setup.fitToHeight = 0
+
+for w, ori in ((wsCS, "landscape"), (wsC, "landscape"), (wsF, "landscape"), (wsT, "landscape"), (wsI, "landscape"), (wsE, "portrait")):
     w.page_setup.orientation = ori
     w.sheet_properties.pageSetUpPr = openpyxl.worksheet.properties.PageSetupProperties(fitToPage=True)
     w.page_setup.fitToWidth = 1
@@ -792,6 +966,8 @@ txt = ["FIVE-YEAR FORECAST MODEL - READ ME", "",
        "  Forecast Detail  One row per QuickBooks account. Pick a forecast method and cash timing per line.",
        "  Cash Flow        Monthly cash flow, 60 months (5 fiscal years, July-June).",
        "  CF Summary       Annual cash flow summary, low-point cash and days cash on hand.",
+       "  Trend            Up to 5 prior years of actuals by category and by account, with a recommended next-year budget for every line.",
+       "  Actuals Import  Five paste slots (A1, J1, S1, AB1, AK1) for prior-year QuickBooks P&L exports; years are set on Inputs.",
        "  QB Import        Paste the QuickBooks budget export here (A1). Helper formulas in D:I map every account to its Major Category.", "",
        "HOW MAJOR CATEGORIES ARE FOUND",
        "  Any row whose label begins with a single digit and a space (e.g. '1 Tuition and Fees') starts a Major Category. Every account beneath it, including",
@@ -811,7 +987,12 @@ txt = ["FIVE-YEAR FORECAST MODEL - READ ME", "",
        "  % of Salaries     Keeps the FY27 ratio to total 'Salary' lines (payroll taxes, 401K).",
        "  Debt              FY27 amount x months of payments remaining (see final mortgage payment date).",
        "  Reserve Yield     Yield % x prior year-end interest-earning balances (Inputs).",
+       "  Trend             FY28 = recommendation from the Trend tab; later years grow with inflation.",
        "  Manual            Type the amount for each year in Forecast Detail columns L:O.", "",
+       "USING PRIOR-YEAR ACTUALS",
+       "  1. Inputs: enter the fiscal year of each actuals export (slots 1-5, oldest to newest).  2. Actuals Import: paste each export at its slot (A1, J1, S1, AB1, AK1).",
+       "  3. Trend: review the category trends and the four methods per account (Last Actual, Average, Linear Trend, Growth); pick a default on Inputs or override per line.",
+       "  4. To budget from the recommendation, set the line's method on Forecast Detail to Trend. Actuals must use the same account numbers / category headers as the budget export.", "",
        "SIMPLIFICATIONS TO KNOW ABOUT",
        "  - Mortgage principal and interest are kept as expenses exactly as in QuickBooks; interest is not stepped down as principal is repaid.",
        "  - Interest income is based on prior year-end balances (opening balances + reserve funding), not the monthly cash flow, to avoid circularity.",
@@ -819,7 +1000,7 @@ txt = ["FIVE-YEAR FORECAST MODEL - READ ME", "",
        "  - Scholarship programs (S4K, Choose Act, AOSF) are driven by the method chosen on their own lines, not by student counts.",
        "  - Strategic Plan Initiatives are incremental to the QuickBooks account '500265 Strategic Plan Expenses'."]
 for i, t in enumerate(txt, start=1):
-    put(ws, f"A{i}", t, f_title if i == 1 else (f_bold if t.isupper() or t.startswith(("TABS", "HOW", "UPDATING", "FORECAST", "SIMPLIF")) else f_norm))
+    put(ws, f"A{i}", t, f_title if i == 1 else (f_bold if t.isupper() or t.startswith(("TABS", "HOW", "UPDATING", "FORECAST", "SIMPLIF", "USING")) else f_norm))
 
 wb.save(OUT)
 print("saved", OUT, "lines:", len(lines))
